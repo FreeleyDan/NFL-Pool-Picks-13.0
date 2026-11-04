@@ -12,9 +12,13 @@ treating every player at a position identically regardless of role.
 """
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from . import config
+
+log = logging.getLogger(__name__)
 
 
 def _build_depth_lookup(depth_df: pd.DataFrame | None) -> tuple[dict, dict]:
@@ -151,6 +155,10 @@ def _long_term_out_from_roster(depth_df, roster_df, already_seen: set) -> list[t
         "depth_team" if "depth_team" in depth_df.columns else None)
     name_col = next((c for c in ("player_name", "full_name", "name") if c in depth_df.columns), None)
     if rank_col is None or name_col is None or "gsis_id" not in depth_df.columns:
+        # Was a silent [] before -- IR starters are invisible without
+        # this join, so log it instead of letting the feature look
+        # like it simply found nothing.
+        log.warning("long-term-out check skipped: depth chart missing rank/name/gsis_id columns")
         return []
 
     roster_status = {}
