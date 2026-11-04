@@ -121,17 +121,32 @@ def srs_ratings(games: pd.DataFrame, hfa: float) -> dict[str, float]:
     global LAST_SRS_CONVERGED, LAST_SRS_DELTA
     LAST_SRS_CONVERGED = False
     LAST_SRS_DELTA = float("inf")
-    for _ in range(config.SRS_MAX_ITERS):
-        new_ratings = {}
+    # CHANGED 2026-11-04 (backtest item 1): damped Jacobi. The undamped
+    # solve does not converge in weeks 2-3 (disconnected game graph,
+    # final delta ~21 pts) and silently returned the 100-iteration
+    # cutoff. Damping (config.SRS_DAMPING, 0.5) cuts that to ~0.006 pts
+    # in the worst harness weeks -- still above the strict 1e-4
+    # tolerance in some weeks, but 0.006 pts is immaterial to any pick,
+    # and damping matches the undamped fixed point to <=0.005 pts
+    # from week 4 on. The final delta is recorded in LAST_SRS_DELTA
+    # so Data Health shows it honestly instead of hiding it.
+    damping = getattr(config, "SRS_DAMPING", 0.5)
+    # Damping slows convergence per iteration, so allow 3x iterations
+    # when damping is on; without it the harness showed final deltas of
+    # 0.001-0.1 pts (tiny in points, but above the 1e-4 tolerance).
+    max_iters = config.SRS_MAX_ITERS * 3 if damping else config.SRS_MAX_ITERS
+    for _ in range(max_iters):
+        computed = {}
         for t in teams:
             num, den = 0.0, 0.0
             for opp, margin, w in edges[t]:
                 num += w * (margin + ratings[opp])
                 den += w
-            new_ratings[t] = (num / den) if den > 0 else 0.0
+            computed[t] = (num / den) if den > 0 else 0.0
         # mean-center so the league average rating is always 0
-        mean = sum(new_ratings.values()) / len(new_ratings)
-        new_ratings = {t: r - mean for t, r in new_ratings.items()}
+        mean = sum(computed.values()) / len(computed)
+        computed = {t: r - mean for t, r in computed.items()}
+        new_ratings = {t: damping * ratings[t] + (1 - damping) * computed[t] for t in teams}
 
         delta = max(abs(new_ratings[t] - ratings[t]) for t in teams)
         ratings = new_ratings
@@ -142,7 +157,7 @@ def srs_ratings(games: pd.DataFrame, hfa: float) -> dict[str, float]:
     if not LAST_SRS_CONVERGED:
         log.warning("SRS did not converge after %s iterations (final delta %.4f) -- "
                     "ratings may be unstable; check Data Health.",
-                    config.SRS_MAX_ITERS, LAST_SRS_DELTA)
+                    max_iters, LAST_SRS_DELTA)
 
     return ratings
 
