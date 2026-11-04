@@ -28,9 +28,32 @@ TEAM_STATS_URL_TMPL = "https://github.com/nflverse/nflverse-data/releases/downlo
 MARGIN_CAP = 21          # cap blowouts before they distort SRS ratings
 RECENT_HALF_LIFE_GAMES = 5   # exponential recency weighting half-life, in games
 PRIOR_REGRESSION = 0.55  # how much of a team's prior-season SRS rating carries into game 1
-PRIOR_FADE_GAMES = 6     # current-season games needed before prior season is ignored
+# CHANGED 2026-11-04 (backtest items 1/6): was 6. Point-in-time backtest
+# 2019-2025 (n=1,871, paired test) found fade-12 beats fade-6 by +2.19 pp
+# ATS (49.84% vs 47.65%, paired z=2.77) and MAE -0.31 pts; fade-10 was
+# +1.42 pp. Still below 50% and below ~52.4% breakeven, and 3 variants were
+# tried, so this is a model-quality improvement, not a betting edge.
+PRIOR_FADE_GAMES = 12    # current-season games needed before prior season is ignored
 SRS_MAX_ITERS = 100
 SRS_TOLERANCE = 1e-4
+# Damped SRS (see ratings.py) needs more iterations than undamped to
+# reach the same tolerance, so ratings.py runs 3*SRS_MAX_ITERS when
+# damping is on; the warning message reports that total, not this value.
+SRS_DAMPING = 0.5        # damped Jacobi for SRS: new = damping*old + (1-damping)*computed.
+                          # The undamped solve does NOT converge in weeks 2-3 (disconnected
+                          # game graph, final delta ~21 pts); damping cuts that to
+                          # ~0.006 pts in the worst harness weeks (immaterial to picks),
+                          # and matches the undamped fixed point to <=0.005 pts from week 4 on.
+DIV_MULTIPLIER = 0.9     # Kept at the original 0.9 (was hardcoded in model.py).
+                          # Situational backtest found divisional margin~spread slopes
+                          # identical to non-divisional (1.051 vs 1.048), which argued
+                          # for removing it, but the harness ablation the other way
+                          # (div09 49.18% vs div1 48.74%, paired z=1.13, 50 flips)
+                          # is noise in the opposite direction. Neither side is
+                          # proven, so the original value stays -- do not claim
+                          # a win for either setting.
+REST_POINTS_PER_DAY = 0.25  # rest adjustment per day of rest differential (see model.py)
+REST_CAP = 2.0           # max rest adjustment in either direction, points
 
 # ---- Home field ----
 # Empirical HFA is computed from your own historical data rather than
@@ -100,10 +123,47 @@ TURNOVER_LUCK_CAP = 3.0           # max rating adjustment in either direction, p
 POOL_LINE_ENABLED_DEFAULT = True
 
 # ---- EPA shadow layer ----
-EPA_LIVE = False         # flip only after grading shows the EPA/combo variant beats baseline
+EPA_LIVE = False         # STAYS False 2026-11-04: app-scale combo (48.9% ATS, worse MAE)
+                          # does NOT beat baseline. The CALIBRATED combo below does in the
+                          # ablation study (see epa.py), but its scale was fit on the same
+                          # sample and the loader changes (prior blending, week filtering)
+                          # are new -- flip only after a walk-forward re-run confirms it.
 EPA_OFF_WEIGHT = 1.6
 EPA_DEF_WEIGHT = 1.0
 EPA_BLEND = 0.5
+# Calibrated EPA scale (backtest item 3): the app formula (1.6*off - 1.0*def)
+# treated as points overstates EPA by ~2.6x. Point-in-time calibration
+# 2019-2025 gives ~0.38 points per EPA unit (0.27 in 2019, 0.38-0.40 from
+# 2021 on). epa.py multiplies its rating by this factor; the resulting
+# calibrated combo (50% weight) was 49.9% ATS / MAE 10.35 vs SRS 48.0% /
+# 10.66 in the ablation, with MAE gains in all 7 seasons -- promising,
+# not proven, hence EPA_LIVE stays False above.
+EPA_POINTS_PER_UNIT = 0.38
+# ---- Cover-probability calibration (backtest item 2) ----
+# Actual margin ~ model margin regresses with slope ~0.68, intercept ~0.36
+# on 2019-2025 point-in-time data (residual SD 13.43): the raw model is
+# over-dispersed. calibration.py shrinks the model margin by these
+# coefficients before turning it into a cover probability. This does NOT
+# change the pick: a shrunk-margin pick test was fit in-sample only
+# (49.4% vs 47.7%, paired z=1.69, 368 flips) and is kept behind
+# CALIBRATED_PICK=False until a walk-forward test confirms it.
+COVER_SHRINK_SLOPE = 0.68
+COVER_SHRINK_INTERCEPT = 0.36
+CALIBRATED_PICK = False  # if True, model.py picks by shrunk margin vs line; OFF by default
+# ---- QB change review signal (backtest item 5) ----
+# Situational proxy 2019-2025: a QB change / non-season-mode QB carries a
+# ~1-1.7 pt penalty the spread does not fully price. This averages ALL
+# changes (benchings, rest, backup-to-backup), NOT just starter injuries,
+# so it is review-only, never auto-applied, and well below the 5.0 starter
+# injury value in POS_VALUE. See injuries.qb_change_suggestion().
+QB_CHANGE_REVIEW_PTS = 1.5
+# ---- Travel (backtest item 6) ----
+# Long-travel away teams beat the spread in 2019-2025 (-2.17 pts residual
+# at >=2,000 mi, slope -0.95 pts/1,000 mi) but the effect is driven by
+# 2019-2020 and inconsistent by season. Kept OFF by default; the
+# function exists in model.py for harness testing only.
+TRAVEL_ENABLED = False
+TRAVEL_POINTS_PER_1000MI = 0.0
 
 # ---- Injuries: review-first, never automatic ----
 INJ_AUTO_APPLY = False   # hard default; only flip after walk-forward ablation says the heuristic helps
