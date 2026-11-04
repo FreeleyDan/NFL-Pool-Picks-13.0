@@ -293,7 +293,14 @@ def load_injuries(season: int, week: int) -> pd.DataFrame | None:
     return filtered
 
 
-def load_team_stats(season: int) -> pd.DataFrame | None:
+def load_team_stats(season: int, week: int | None = None) -> pd.DataFrame | None:
+    """Load team EPA stats. If `week` is given, only rows for weeks
+    strictly before that week are returned (point-in-time, backtest
+    item 3): the published file is full-season, so using it unfiltered
+    in any retrospective grading leaks future weeks and playoff rows.
+    The live weekly run should pass the target week here; mid-season
+    the file then holds only completed weeks anyway, so the filter is
+    harmless there and essential in backtests."""
     url = config.TEAM_STATS_URL_TMPL.format(season=season)
     try:
         df = _fetch_csv(url)
@@ -314,5 +321,15 @@ def load_team_stats(season: int) -> pd.DataFrame | None:
         df["opponent_team"] = df["opponent_team"].map(config.normalize_team)
     if "season" in df.columns:
         df = df[df["season"] == season]
-    _record("Fetch team EPA stats", True, f"URL: {url} -- {len(df)} rows for season {season}")
+    if week is not None and "week" in df.columns:
+        df = df[pd.to_numeric(df["week"], errors="coerce") < week]
+    # Exclude postseason rows where the file carries a game/season type
+    # marker; regular-season EPA only, matching the ratings input.
+    for col in ("season_type", "game_type"):
+        if col in df.columns:
+            df = df[df[col].astype(str).str.upper().isin({"REG", "REGULAR"}) | df[col].isna()] \
+                if df[col].notna().any() else df
+            break
+    _record("Fetch team EPA stats", True, f"URL: {url} -- {len(df)} rows for season {season}"
+            + (f", weeks before {week}" if week is not None else ""))
     return df
