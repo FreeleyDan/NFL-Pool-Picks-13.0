@@ -263,6 +263,14 @@ def _run():
         pts_for=pts_for, pts_against=pts_against, pool_lines=pool_lines,
     )
     db.save_picks(config.SEASON, predictions)
+    # Line snapshots (item 7): pool line when set, closing/live line
+    # always when present. The dashboard's line-moves section compares
+    # these; a move never auto-switches the pool line.
+    for p in predictions:
+        if p.pool_spread is not None:
+            db.save_line_snapshot(config.SEASON, week, p.home, p.away, "pool", p.pool_spread)
+        if p.vegas_spread is not None:
+            db.save_line_snapshot(config.SEASON, week, p.home, p.away, "closing", p.vegas_spread)
     db.save_injury_review(config.SEASON, week, inj_review["detail"])
     db.save_model_log(config.SEASON, predictions)
 
