@@ -19,7 +19,18 @@ def grade_and_summarize(db_path: str | None = None):
         results[key] = float(r["result"])
 
     with db.connect(db_path) as conn:
-        rows = conn.execute("SELECT rowid, * FROM model_log").fetchall()
+        # FIXED 2026-11-04: exclude backfill rows. They were predicted
+        # after the game from ratings that already contain the result,
+        # so counting them inflates MAE/ATS and could falsely promote
+        # the EPA layer. Rows written before this fix have
+        # is_backfill=0 by migration and cannot be distinguished --
+        # if you suspect old grades are inflated, delete model_log
+        # rows you know were backfilled and re-run.
+        try:
+            rows = conn.execute(
+                "SELECT rowid, * FROM model_log WHERE COALESCE(is_backfill, 0) = 0").fetchall()
+        except Exception:
+            rows = conn.execute("SELECT rowid, * FROM model_log").fetchall()
         stats = {"vegas": [], "margin": {"err": [], "ats": 0, "n": 0},
                  "epa": {"err": [], "ats": 0, "n": 0}, "combo": {"err": [], "ats": 0, "n": 0}}
 
@@ -29,6 +40,8 @@ def grade_and_summarize(db_path: str | None = None):
             if actual is None:
                 continue
             vegas = row["vegas_close"]
+            if vegas is None:
+                continue  # used to crash with TypeError on abs(None - actual)
             stats["vegas"].append(abs(vegas - actual))
 
             updates = {"actual_margin": actual}
