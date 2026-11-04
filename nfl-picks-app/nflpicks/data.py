@@ -117,7 +117,15 @@ def load_games(season: int) -> pd.DataFrame:
 
 
 def split_games(games: pd.DataFrame, season: int):
-    """Split into (played_current, played_prior, upcoming_next_week)."""
+    """Split into (played_current, played_prior, upcoming_next_week).
+
+    FIXED 2026-11-04: upcoming used to require spread_line.notna(), so a
+    game whose line had not posted yet vanished from the slate entirely.
+    This pool requires a pick on EVERY game, so an unlined game must
+    still appear -- model.py then gives it a model-only read with
+    pick=None / edge=None (and a pool override, if set, still drives a
+    real pick), instead of silently dropping the game.
+    """
     played_mask = games["result"].notna()
     cur = games["season"] == season
     prior = games["season"] == season - 1
@@ -125,7 +133,7 @@ def split_games(games: pd.DataFrame, season: int):
     played = games[played_mask & cur].copy()
     played_prior = games[played_mask & prior].copy()
 
-    upcoming = games[(~played_mask) & cur & games["spread_line"].notna()].copy()
+    upcoming = games[(~played_mask) & cur].copy()
     if len(upcoming):
         next_week = int(upcoming["week"].min())
         upcoming = upcoming[upcoming["week"] == next_week].copy()
@@ -258,6 +266,15 @@ def load_injuries(season: int, week: int) -> pd.DataFrame | None:
     rows_per_week = df["week"].value_counts().sort_index().to_dict()
 
     filtered = df[df["week"] == week].copy()
+    # Dedup: if the source lists the same player more than once in a
+    # week, injuries.review_injuries would otherwise sum that player's
+    # impact twice. Keep the last row per player.
+    if "full_name" in filtered.columns:
+        before_dedup = len(filtered)
+        filtered = filtered.drop_duplicates(subset=["team", "full_name"], keep="last")
+        if len(filtered) != before_dedup:
+            _record("Dedup injury rows", True,
+                    f"Removed {before_dedup - len(filtered)} duplicate player row(s) for week {week}.")
     filtered["team"] = filtered["team"].map(config.normalize_team)
 
     detail = (
