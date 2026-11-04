@@ -120,6 +120,114 @@ Backfilled games (predicted after they were played, from today's
 ratings) are flagged `is_backfill` in `model_log` and excluded from
 grades, so they can't inflate those numbers with look-ahead bias.
 
+## Backtest results (2026-11-04, items 1-7) -- read before trusting any number
+
+Run it yourself:
+
+```bash
+python -m nflpicks.backtest --games-csv /path/to/games.csv --seasons 2019-2025 --variants baseline,fade6,div1,calibrated_pick,offdef
+```
+
+The harness (`nflpicks/backtest.py`) is point-in-time: for season S,
+week W, ratings use only season-S games before week W plus the full
+season S-1. Backfill cannot leak in (no model_log read at all).
+Caveat that applies to every number below: `spread_line` in
+games.csv is the recorded line, NOT a verified Tuesday/Thursday
+pool-locked line, so ATS against a real pool line will differ.
+
+Harness, live-like HFA, 2019-2025 (n=1,871 games, 1,828 decided):
+
+- **Current live defaults (fade-12, div 0.9): 49.12% ATS, MAE 10.34**
+  (recorded line MAE 9.83 on the same games -- the model still trails
+  the market, and 49.12% is below ~52.4% breakeven. This is a
+  model-quality improvement, not a betting edge.)
+- Fade-6 (old setting): 47.16% (-1.97 pp vs live, paired z=-2.5).
+  Slower prior fade is the one clear win, hence
+  `PRIOR_FADE_GAMES=12` in config.py.
+- Div 1.0 vs 0.9: 48.69% (-0.44 pp, paired z=-1.13, noise). The
+  divisional discount is therefore kept at the original 0.9 -- neither
+  setting is proven, so no change is claimed.
+- Calibrated pick (pick by shrunk margin vs line): 50.16% (+1.04 pp,
+  paired z=0.99, 369 flips). Noise on this sample, and the shrinkage
+  coefficients were fit on the same data, so `CALIBRATED_PICK` stays
+  False. Cover Prob itself IS calibrated (see below) -- that is a
+  confidence signal, not a pick change.
+- Offense/defense split SRS (harness diagnostic only): 48.85%
+  (+0.11 pp, paired z=0.08) with MAE 10.71 (worse). NOT promoted.
+  The separate ablation study agreed: split is 98.4% correlated with
+  single SRS and significantly worse on MAE. Do not promote it.
+- Travel (0.95 pts/1,000 mi, harness only): 49.67% (+0.93 pp, paired
+  z=1.28, noise). `TRAVEL_ENABLED` stays False.
+
+Earlier analysis scripts (prior-season-only HFA, slightly different
+from the harness) reported baseline 47.65% ATS, fade-12 49.84%, and
+half-life 8 as a null (47.70%). Those numbers are superseded as the
+canonical ones by the harness above, but they point the same way.
+
+**Item 2 -- Cover Prob is now calibrated.** Old: normal curve, SD
+13.5, around the raw model margin. New (`nflpicks/calibration.py`):
+actual margin regresses on model margin with slope 0.68, intercept
+0.36, residual SD 13.43, and cover probability interpolates the
+empirical residual CDF from 2019-2025 (key-number clustering kept:
+actual margin == 3 in 7.1% of games per side, == 7 in ~4.2%).
+A Cover Prob near or below 50% for the official pick is honest:
+after shrinkage that side is not actually favoured -- treat it as a
+coin flip.
+
+**Item 3 -- EPA, NOT promoted.** App-scale combo (1.6*off - 1.0*def
+as points) was 48.9% ATS with significantly worse MAE -- do not flip
+`EPA_LIVE` on that basis. Calibrated scale (0.38 pts per EPA unit,
+`EPA_POINTS_PER_UNIT` in config.py, applied in `epa.py`) gave, in the
+7-season ablation, a 50% combo of 49.9% ATS / MAE 10.35 vs SRS
+48.0% / 10.66, MAE gains in all 7 seasons -- but ATS p=0.04 would not
+survive Bonferroni across 9 variants, and my own 2024-2025 replication
+was 50.46% vs 49.17% (paired z=0.73, noise). `EPA_LIVE` therefore stays
+False. What WAS built: calibrated EPA ratings, prior-season blending
+(`epa.blend_epa_ratings`), and week-filtered team-stats loading
+(`data.load_team_stats(season, week)` -- the published file is
+full-season, so unfiltered retrospective use leaks future weeks).
+
+**Item 5 -- QB, review-only as before.** `injuries.qb_change_suggestion`
+adds a 1.5 pt review-only signal when a team's QB name changes from
+the previous game. That is a situational proxy (~1-1.7 pt penalty in
+2019-2025, averaged over ALL changes including benchings/rest), NOT
+a causal starter-injury value and NOT a substitute for the 5.0
+starter-injury value when a starter is OUT/DOUBTFUL.
+`INJ_AUTO_APPLY` stays False. Thursday practice participation is
+already used in `review_injuries` (DNP=0.6, LP=0.25 when report_status
+is empty); the weekly files carry no day-of-week, so no finer
+Thursday signal is available from this data.
+
+**Item 6 -- Rest / travel / HFA.** Rest stays 0.25 pts/day capped at
+2.0 as a margin predictor (ATS residual slope was -0.03 +/- 0.12
+pts/day, meaning the market already prices rest -- raising it would
+create false edges). No bye or short-week extra: pooled bye residual
+was -0.83 (wrong sign, n.s.) and one-sided short-week contrasts had
+n=0. Travel stays off (see above). HFA stays league-wide empirical,
+clamped 0.5-3.0, zero at neutral sites: team-specific HFA was mostly
+noise (team ATS-residual SD 1.44 vs mean SE 1.73). Denver altitude:
+no effect found (n=59, noise) -- not implemented.
+
+**Item 7 -- Line movement.** `db.line_snapshots` records the pool line
+(source 'pool') and the live/closing line (source 'closing') per game
+per run (written by `weekly_run.py`); `db.get_line_moves` and a new
+dashboard section flag games where movement is >= 1 pt or the model
+edge flips between the two lines, for Thursday-morning manual review.
+The pool line is NEVER auto-switched -- it is what you are judged
+against. Until both snapshots exist for a week, the section is empty,
+not an error.
+
+**Still off by default, on purpose:** `EPA_LIVE=False`,
+`CALIBRATED_PICK=False`, `TRAVEL_ENABLED=False`,
+`INJ_AUTO_APPLY=False`. Each has a harness variant to re-test it;
+flip one only on a walk-forward win, not on a single-season result.
+
+**Known limits that remain:** early-season SRS damping cuts the
+weeks 2-3 non-convergence from delta ~21 pts to ~0.006 pts (immaterial
+to picks) but does not always reach the strict 1e-4 tolerance; the
+live workflow run has not yet been observed end-to-end; team-stats
+EPA is not SOS-iterative (naive defense average, as before).
+
 ## Roadmap (as you said: start simple, then get more sophisticated)
 
 Already better than the original Sheets version:
