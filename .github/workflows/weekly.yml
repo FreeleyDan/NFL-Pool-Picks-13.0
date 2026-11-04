@@ -1,0 +1,56 @@
+# Weekly NFL pool picks run -- NO EMAIL (per user, 2026-11-04).
+#
+# Runs Tuesday and Thursday at 15:00 UTC (7:00 AM PT in winter, 8:00 AM PT
+# in summer). Thursday's run is the one that matters for Barbara's pool:
+# picks are due Thursday at 11:00 AM PT, so Thursday morning catches the
+# latest lines and practice reports before the deadline. Tuesday's run
+# grades the games that just finished and gives an early look.
+#
+# What it does:
+#   1. weekly_run.py -- pulls data, computes ratings, saves picks to SQLite
+#   2. python -m nflpicks.grading -- grades completed games (backfill rows
+#      are excluded from grades; see grading.py)
+#   3. Commits the updated database back to the repo (force-add, because
+#      *.db is gitignored for local dev) so Streamlit Cloud picks it up
+#      on its next redeploy.
+#
+# No SMTP secrets are needed or used. weekly_run skips email when
+# SMTP_HOST is unset, and an email failure can no longer abort the run.
+name: Weekly NFL picks
+
+on:
+  schedule:
+    - cron: "0 15 * * 2,4"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nfl-picks-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      # Season defaults to config.SEASON (2026). To run a different
+      # season, edit config.py -- do NOT set PICKS_SEASON to an empty
+      # value here, or config.py's int() will crash on "".
+      - name: Run weekly picks
+        run: python weekly_run.py
+      - name: Grade completed games
+        run: python -m nflpicks.grading || true
+      - name: Commit updated database
+        working-directory: .
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -f nfl-picks-app/nfl_picks.db
+          git diff --cached --quiet || git commit -m "Weekly picks update [skip ci]"
+          git push
