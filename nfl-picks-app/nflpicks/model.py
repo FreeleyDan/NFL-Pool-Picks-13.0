@@ -6,6 +6,7 @@ runWeeklyPicks() scoring loop in the Apps Script version.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import pandas as pd
 
@@ -34,9 +35,10 @@ class GamePrediction:
     vegas_total: float | None = None
     model_total: float | None = None
     weather_note: str = ""
-    pool_spread: float | None = None   # your pool's locked spread, if you set one (drives the pick)
+    pool_spread: float | None = None   # your pool's locked spread, NFLVERSE convention (see config)
     pool_total: float | None = None    # your pool's locked total, if you set one (drives the total pick)
     total_pick: str | None = None
+    cover_prob: float | None = None    # P(pick covers), normal approx. with SURVIVOR_SPREAD_STDEV
 
 
 def _rest_adjustment(home_rest, away_rest) -> float:
@@ -44,6 +46,32 @@ def _rest_adjustment(home_rest, away_rest) -> float:
         return 0.0
     diff = float(home_rest) - float(away_rest)
     return max(-2.0, min(2.0, diff * 0.25))
+
+
+def _is_div_game(value) -> bool:
+    # nflverse div_game arrives as int 1/0 in games.csv, but a CSV or
+    # DataFrame round-trip can turn it into "1", 1.0, or True. The old
+    # code only matched str(value) == "1", so True/1.0 silently lost the
+    # divisional discount. Accept every truthy 1-form.
+    if isinstance(value, bool):
+        return value
+    try:
+        return float(value) == 1.0
+    except (TypeError, ValueError):
+        return str(value).strip() == "1"
+
+
+def _is_neutral(location) -> bool:
+    return str(location or "").strip().lower() == "neutral"
+
+
+def _cover_probability(independent: float, line: float) -> float:
+    # P(home covers) under a normal approx. for (actual margin - model
+    # margin) with the same stdev the survivor model uses. The pick's
+    # cover probability is max(p, 1-p) in the caller; this returns the
+    # home-side probability so the direction is unambiguous.
+    z = (independent - line) / config.SURVIVOR_SPREAD_STDEV
+    return round(0.5 * (1 + math.erf(z / math.sqrt(2))), 3)
 
 
 def predict_game(
@@ -73,8 +101,8 @@ def predict_game(
     r_away = team_ratings.get(away, 0.0) + manual_adj.get(away, 0.0) + inj_a
 
     rest_adj = _rest_adjustment(row.get("home_rest"), row.get("away_rest"))
-    div_mult = 0.9 if str(row.get("div_game")) == "1" else 1.0
-    effective_hfa = 0.0 if row.get("location") == "Neutral" else hfa
+    div_mult = 0.9 if _is_div_game(row.get("div_game")) else 1.0
+    effective_hfa = 0.0 if _is_neutral(row.get("location")) else hfa
 
     margin_model = (r_home - r_away + effective_hfa + rest_adj) * div_mult
 
@@ -118,11 +146,23 @@ def predict_game(
         trust = confidence * config.MARKET_TRUST_COMPLEMENT
         official = line_for_pick + raw_deviation * trust
     else:
+        raw_deviation = None
         official = independent
 
     edge = (official - line_for_pick) if line_for_pick is not None else None
+    # FIXED 2026-11-04: flags are computed from the RAW deviation, not the
+    # blended edge. Blending only changes the displayed edge magnitude;
+    # it does NOT change the pick (the pick follows the deviation's sign),
+    # so a "damped" edge must not be used to decide whether a pick is
+    # strong or implausible -- that made both flags effectively dead.
+    # strong_edge / needs_review below now use raw_deviation.
+    cover_prob = None
     pick = None
     if edge is not None:
+        home_cover = _cover_probability(independent, line_for_pick)
+        cover_prob = home_cover if edge > 0 else round(1 - home_cover, 3)
+        if edge == 0:
+            cover_prob = 0.5
         if line_for_pick == 0:
             pick = f"{home if edge > 0 else away} PK"
         else:
@@ -154,6 +194,8 @@ def predict_game(
                 total_pick = f"{'OVER' if t_edge > 0 else 'UNDER'} {total_for_pick:g}"
             else:
                 total_pick = "no play"
+        else:
+            total_pick = "no line"
 
     return GamePrediction(
         week=int(row["week"]), home=home, away=away,
@@ -162,13 +204,15 @@ def predict_game(
         margin_model=round(margin_model, 1), combo_model=combo_model,
         edge=round(edge, 1) if edge is not None else None,
         pick=pick, confidence=confidence,
-        strong_edge=bool(edge is not None and config.EDGE_THRESHOLD <= abs(edge) < config.SANITY_EDGE_FLAG),
-        needs_review=bool(edge is not None and abs(edge) >= config.SANITY_EDGE_FLAG),
+        strong_edge=bool(raw_deviation is not None
+                          and config.EDGE_THRESHOLD <= abs(raw_deviation) < config.SANITY_EDGE_FLAG),
+        needs_review=bool(raw_deviation is not None and abs(raw_deviation) >= config.SANITY_EDGE_FLAG),
         epa_shadow=epa_model,
         manual_adj_home=manual_adj.get(home, 0.0), manual_adj_away=manual_adj.get(away, 0.0),
         vegas_total=vegas_total, model_total=model_total, total_pick=total_pick,
         weather_note=weather_note,
         pool_spread=pool_spread, pool_total=pool_total,
+        cover_prob=cover_prob,
     )
 
 
@@ -191,7 +235,10 @@ def predict_completed_games(
     manual adjustments are applied (those were day-of context that's
     lost in hindsight), and no market-blending is needed since we're
     just recording the raw model read against the market line that
-    already existed for that game.
+    already existed for that game. Callers must save these with
+    db.save_model_log(..., is_backfill=True) so grading.py excludes
+    them -- they use today's ratings, which already contain these
+    games' results, and counting them would inflate grades.
     """
     preds = []
     for _, row in completed.iterrows():
@@ -279,8 +326,8 @@ def predict_full_schedule(
         r_home = team_ratings.get(home, 0.0)
         r_away = team_ratings.get(away, 0.0)
         rest_adj = _rest_adjustment(row.get("home_rest"), row.get("away_rest"))
-        div_mult = 0.9 if str(row.get("div_game")) == "1" else 1.0
-        effective_hfa = 0.0 if row.get("location") == "Neutral" else hfa
+        div_mult = 0.9 if _is_div_game(row.get("div_game")) else 1.0
+        effective_hfa = 0.0 if _is_neutral(row.get("location")) else hfa
         model_margin = (r_home - r_away + effective_hfa + rest_adj) * div_mult
         rows.append({
             "week": int(row["week"]), "home_team": home, "away_team": away,
