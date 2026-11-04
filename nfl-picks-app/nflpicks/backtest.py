@@ -52,7 +52,9 @@ from collections.abc import Callable
 
 import pandas as pd
 
-from . import calibration, config, model as model_mod, ratings as ratings_mod
+from . import calibration, config, elo as elo_mod, ensemble as ensemble_mod, epa as epa_mod, \
+    features as features_mod, market as market_mod, model as model_mod, ratings as ratings_mod, \
+    scoring as scoring_mod
 
 VARIANTS: dict[str, dict] = {
     # name -> config overrides (empty = current live defaults)
@@ -69,6 +71,10 @@ VARIANTS: dict[str, dict] = {
     # epa_live=True and grades pred.model_independent (the combo) for
     # this variant only, when an epa_ratings_fn callback is supplied.
     "epa_cal": {},
+    # epa_sos: same grading rule as epa_cal, but the caller-supplied
+    # epa_ratings_fn must return SOS-iterative EPA ratings
+    # (epa.sos_epa_ratings, blended) rather than naive ones. Batch 2.
+    "epa_sos": {},
 }
 
 
@@ -199,12 +205,13 @@ def evaluate_variant(games: pd.DataFrame, seasons: list[int], variant: str = "ba
                         pred = model_mod.predict_game(
                             row, ratings_for_week, games_played, hfa,
                             epa_ratings=epa_ratings,
-                            epa_live=(variant == "epa_cal"),
+                            epa_live=(variant in ("epa_cal", "epa_sos")),
                         )
-                        # epa_cal grades the combo (model_independent
-                        # when epa_live=True); every other variant grades
-                        # the SRS margin_model, matching live behaviour.
-                        model_margin = pred.model_independent if variant == "epa_cal" else pred.margin_model
+                        # epa_cal / epa_sos grade the combo
+                        # (model_independent when epa_live=True); every
+                        # other variant grades the SRS margin_model,
+                        # matching live behaviour.
+                        model_margin = pred.model_independent if variant in ("epa_cal", "epa_sos") else pred.margin_model
                     actual = float(row["home_score"]) - float(row["away_score"])
                     line = float(row["spread_line"])
                     # Calibrated-pick variant grades the SHRUNK pick, not
@@ -233,6 +240,96 @@ def evaluate_variant(games: pd.DataFrame, seasons: list[int], variant: str = "ba
                         "line_abs_err": abs(actual - line),
                     })
     return summarize(rows, variant)
+
+
+def evaluate_totals(games: pd.DataFrame, seasons: list[int], in_sample: bool = False) -> dict:
+    """Totals harness (item 8): old scoring-average blend vs SRS
+    offensive/defensive splits, on the SAME games, totals-only. The
+    spread harness is untouched -- this neither reads nor writes any
+    spread result, and its MAE numbers are not comparable to spread
+    MAE (different target: combined points, not margin).
+
+    Out-of-sample (default, the promotion test): for season S, week W,
+    both models use only season-S games before week W plus the full
+    season S-1, with point-in-time empirical HFA -- exactly the
+    information a live run in week W would have had. No parameter is
+    fitted on the target seasons: the SRS solve uses fixed config
+    constants (damping, tolerance, prior fade/regression), so there is
+    no training window to leak, and no walk-forward weight learning
+    is needed or claimed.
+
+    In-sample (in_sample=True, reported separately, never the
+    promotion test): both models use the FULL target season plus the
+    prior season, then predict that same season's games. The gap
+    between in-sample and out-of-sample MAE is the overfit/noise check:
+    a model that only wins in-sample has memorised its own targets.
+
+    Weather is excluded from BOTH models here: the live weather
+    adjustment needs a forecast API call, which games.csv cannot
+    supply retrospectively, and applying it to one model only would
+    rig the comparison. The live weather step in model.py applies
+    identically on either totals path, so it cannot change which
+    model wins this harness.
+
+    Returns MAEs (old, SRS, and the recorded total_line as a market
+    reference), per-season MAEs, paired old-minus-SRS statistics, and
+    the per-game frame under '_games' (stripped by the CLI).
+    """
+    rows: list[dict] = []
+    for season in seasons:
+        season_games = games[games["season"] == season]
+        prior_games = games[(games["season"] == season - 1) & games["result"].notna()]
+        weeks = sorted(season_games[season_games["result"].notna()]["week"].unique().tolist())
+        for week in weeks:
+            if in_sample:
+                played_current = season_games[season_games["result"].notna()]
+            else:
+                played_current = season_games[(season_games["week"] < week) & season_games["result"].notna()]
+            hfa = ratings_mod.compute_empirical_hfa(played_current, prior_games)
+            pts_for, pts_against = scoring_mod.blended_scoring_averages(played_current, prior_games)
+            off, deff, league_avg = scoring_mod.blended_srs_scoring(played_current, prior_games, hfa)
+            targets = season_games[(season_games["week"] == week) & season_games["result"].notna()
+                                   & season_games["total_line"].notna()]
+            for _, row in targets.iterrows():
+                home, away = row["home_team"], row["away_team"]
+                old_total = scoring_mod.predict_total(home, away, pts_for, pts_against)
+                srs_total = scoring_mod.predict_total_srs(home, away, off, deff, league_avg)
+                actual = float(row["home_score"]) + float(row["away_score"])
+                line = float(row["total_line"])
+                rows.append({
+                    "season": int(season), "week": int(week),
+                    "home_team": home, "away_team": away,
+                    "old_total": old_total, "srs_total": srs_total,
+                    "line_total": line, "actual_total": actual,
+                    "old_err": abs(actual - old_total), "srs_err": abs(actual - srs_total),
+                    "line_err": abs(actual - line),
+                })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return {"in_sample": in_sample, "n": 0, "_games": df}
+    paired = df["old_err"] - df["srs_err"]
+    by_season = {}
+    for season, sub in df.groupby("season"):
+        by_season[str(int(season))] = {
+            "n": int(len(sub)),
+            "old_mae": round(float(sub["old_err"].mean()), 3),
+            "srs_mae": round(float(sub["srs_err"].mean()), 3),
+            "line_mae": round(float(sub["line_err"].mean()), 3),
+        }
+    return {
+        "in_sample": in_sample,
+        "n": int(len(df)),
+        "old_mae": round(float(df["old_err"].mean()), 3),
+        "srs_mae": round(float(df["srs_err"].mean()), 3),
+        "line_mae": round(float(df["line_err"].mean()), 3),
+        "paired_old_minus_srs_mean": round(float(paired.mean()), 3),
+        "paired_se": round(float(paired.std(ddof=1) / math.sqrt(len(paired))), 3) if len(paired) > 1 else None,
+        "srs_wins": int((df["srs_err"] < df["old_err"]).sum()),
+        "old_wins": int((df["old_err"] < df["srs_err"]).sum()),
+        "ties": int((df["old_err"] == df["srs_err"]).sum()),
+        "by_season": by_season,
+        "_games": df,
+    }
 
 
 def summarize(rows: list[dict], variant: str = "baseline") -> dict:
@@ -268,10 +365,245 @@ def summarize(rows: list[dict], variant: str = "baseline") -> dict:
     }
 
 
+def _ats_rows(rows: list[dict], margin_key: str) -> list[dict]:
+    """Re-express component rows as summarize()-compatible rows graded
+    on the margin in `margin_key` (None margins are dropped)."""
+    out = []
+    for r in rows:
+        m = r.get(margin_key)
+        if m is None:
+            continue
+        line, actual = float(r["spread_line"]), float(r["actual_margin"])
+        # A combined margin exactly equal to the line is NO pick (this
+        # happens for market-only weights, where margin == line by
+        # construction), not a wrong pick -- grading it "wrong" produced
+        # a spurious 0% ATS for the market-weight ensemble in the first
+        # batch-2 run. This push rule applies to batch-2 rows only;
+        # evaluate_variant's historical grading is left untouched so
+        # the canonical baseline numbers stay comparable.
+        if m == line:
+            ats = "push"
+        elif actual > line:
+            ats = "correct" if m > line else "wrong"
+        elif actual < line:
+            ats = "correct" if m < line else "wrong"
+        else:
+            ats = "push"
+        out.append({
+            "season": r["season"], "week": r["week"],
+            "home_team": r["home_team"], "away_team": r["away_team"],
+            "model_margin": round(float(m), 3), "spread_line": line,
+            "actual_margin": actual, "edge": round(float(m) - line, 3),
+            "edge_bucket": ("0-1" if abs(float(m) - line) < 1 else "1-3" if abs(float(m) - line) < 3 else
+                            "3-5" if abs(float(m) - line) < 5 else "5-8" if abs(float(m) - line) < 8 else "8+"),
+            "pick_side": "home" if m > line else "away",
+            "pick_favdog": ("fav" if (line > 0 and m > line) or (line < 0 and m < line) else "dog"),
+            "week_bucket": "1-4" if r["week"] <= 4 else "5-9" if r["week"] <= 9 else "10+",
+            "ats": ats, "abs_err": abs(actual - float(m)),
+            "line_abs_err": abs(actual - line),
+        })
+    return out
+
+
+def evaluate_ensemble_and_features(games: pd.DataFrame, seasons: list[int],
+                                   team_stats_by_season: dict | None = None) -> dict:
+    """Batch-2 evaluation: ensemble (SRS + Elo + SOS-EPA + market) and
+    play-by-play-proxy features, all walk-forward at SEASON level.
+
+    For each target week, SRS / Elo / EPA / feature inputs use only
+    that season's games before the week plus the full prior season
+    (team stats: weeks before the week plus the full prior season).
+    Ensemble weights and feature coefficients for season S are learned
+    ONLY from completed seasons before S (plus two burn-in seasons
+    before the first evaluated season, scored nowhere), so every
+    ensemble/feature number below is out-of-sample w.r.t. its weights.
+    In-sample (training-window) fits are reported separately under
+    "train" so a training win that evaporates out-of-sample is visible
+    instead of hidden.
+
+    team_stats_by_season: {season: full-season team-stats frame} as
+    returned by data.load_team_stats(season) (week=None). Missing
+    seasons -> EPA and feature components are None for those games
+    and the ensemble renormalizes over the available components.
+    Returns summaries for baseline (SRS), ensemble_wf, ensemble_equal,
+    one per-feature variant, features_all (marginal-fit sum), plus
+    market cross-check diagnostics and the learned weights/coeffs.
+    """
+    team_stats_by_season = team_stats_by_season or {}
+    all_teams = sorted(set(games["home_team"]) | set(games["away_team"]))
+    first = min(seasons)
+    burn_in = [s for s in (first - 2, first - 1)
+               if ((games["season"] == s) & games["result"].notna()).any()]
+    ordered = burn_in + [s for s in seasons]
+    elo_state = elo_mod.new_state(all_teams)
+    train_rows: list[dict] = []
+    scored_rows: list[dict] = []
+    weights_by_season: dict[int, dict] = {}
+    weights_ats_by_season: dict[int, dict] = {}
+    coeffs_by_season: dict[int, dict] = {}
+    train_fit_by_season: dict[int, dict] = {}
+    prior_sos_cache: dict[int, dict] = {}
+    for si, season in enumerate(ordered):
+        if si > 0:
+            elo_state = elo_mod.regress_state(elo_state)
+        is_eval = season in seasons
+        if is_eval:
+            learned = ensemble_mod.learn_weights(train_rows)
+            weights_by_season[season] = learned["weights"]
+            train_fit_by_season[season] = learned["train"]
+            learned_ats = ensemble_mod.learn_weights(train_rows, objective="ats")
+            weights_ats_by_season[season] = learned_ats["weights"]
+            coeffs = {f: features_mod.fit_feature_coeff(train_rows, f)
+                      for f in list(features_mod.FEATURES) + list(features_mod.INTERACTIONS)}
+            coeffs_by_season[season] = coeffs
+        else:
+            coeffs = {}
+        season_games = games[games["season"] == season]
+        prior_games = games[(games["season"] == season - 1) & games["result"].notna()]
+        ts_cur_full = team_stats_by_season.get(season)
+        ts_prior_full = team_stats_by_season.get(season - 1)
+        if ts_prior_full is not None and season - 1 not in prior_sos_cache:
+            sos_prior = epa_mod.sos_epa_ratings(ts_prior_full)
+            prior_sos_cache[season - 1] = sos_prior.get("ratings") or {}
+        sos_prior = prior_sos_cache.get(season - 1, {})
+        weeks = sorted(season_games[season_games["result"].notna()]["week"].unique().tolist())
+        season_rows: list[dict] = []
+        for week in weeks:
+            played_current = season_games[(season_games["week"] < week) & season_games["result"].notna()]
+            hfa = ratings_mod.compute_empirical_hfa(played_current, prior_games)
+            ratings_for_week, games_played = ratings_mod.blended_team_ratings(played_current, prior_games, hfa)
+            # SOS-EPA for this week (current weeks < W, prior full).
+            epa_ratings = None
+            if ts_cur_full is not None and "week" in ts_cur_full.columns:
+                cur_filtered = ts_cur_full[pd.to_numeric(ts_cur_full["week"], errors="coerce") < week]
+                sos_cur = epa_mod.sos_epa_ratings(cur_filtered)
+                epa_ratings = epa_mod.blend_epa_ratings(
+                    sos_cur.get("ratings") or {}, sos_prior, games_played)
+            elif ts_cur_full is not None:
+                sos_cur = epa_mod.sos_epa_ratings(ts_cur_full)
+                epa_ratings = epa_mod.blend_epa_ratings(
+                    sos_cur.get("ratings") or {}, sos_prior, games_played)
+            # Feature rates: prior full + current weeks < W.
+            feat_rates, feat_league = {}, {}
+            if ts_cur_full is not None or ts_prior_full is not None:
+                frames = [f for f in (ts_prior_full,
+                                      ts_cur_full[pd.to_numeric(ts_cur_full["week"], errors="coerce") < week]
+                                      if (ts_cur_full is not None and "week" in ts_cur_full.columns)
+                                      else ts_cur_full) if f is not None and len(f)]
+                if frames:
+                    feat_rates = features_mod.team_feature_rates(pd.concat(frames, ignore_index=True))
+                    feat_league = features_mod.league_rates(feat_rates)
+            targets = season_games[(season_games["week"] == week) & season_games["result"].notna()
+                                   & season_games["spread_line"].notna()]
+            for _, row in targets.iterrows():
+                home, away = row["home_team"], row["away_team"]
+                pred = model_mod.predict_game(row, ratings_for_week, games_played, hfa)
+                srs_margin = pred.margin_model
+                eff_hfa = 0.0 if str(row.get("location") or "").strip().lower() == "neutral" else hfa
+                elo_margin = elo_mod.elo_margin(
+                    elo_state.get(home, float(config.ELO_START)),
+                    elo_state.get(away, float(config.ELO_START)), eff_hfa)
+                epa_margin = None
+                if epa_ratings and home in epa_ratings and away in epa_ratings:
+                    rest_adj = model_mod._rest_adjustment(row.get("home_rest"), row.get("away_rest"))
+                    div_mult = getattr(config, "DIV_MULTIPLIER", 1.0) if model_mod._is_div_game(row.get("div_game")) else 1.0
+                    epa_margin = round((epa_ratings[home] - epa_ratings[away] + eff_hfa + rest_adj) * div_mult, 1)
+                line = float(row["spread_line"])
+                actual = float(row["home_score"]) - float(row["away_score"])
+                rec = {
+                    "season": int(season), "week": int(week),
+                    "home_team": home, "away_team": away,
+                    "srs_margin": srs_margin, "elo_margin": round(elo_margin, 3),
+                    "epa_margin": epa_margin, "market_margin": line,
+                    "spread_line": line, "actual_margin": actual,
+                    "model_margin": srs_margin,
+                }
+                diffs = features_mod.game_feature_differentials(row, feat_rates, feat_league) if feat_rates else {}
+                for f, d in diffs.items():
+                    rec[f"{f}_diff"] = d
+                cc = market_mod.crosscheck(
+                    line, row.get("home_moneyline"), row.get("away_moneyline"),
+                    row.get("total_line"), model_margin=srs_margin)
+                rec["ml_margin"] = cc["ml_implied_margin"]
+                rec["ml_flag"] = bool(any("spread/ML disagree" in fl for fl in cc["flags"]))
+                season_rows.append(rec)
+            # Elo advances on this week's results (pre-week snapshot).
+            week_played = season_games[(season_games["week"] == week) & season_games["result"].notna()]
+            elo_state = elo_mod.apply_week(elo_state, week_played)
+        if is_eval:
+            w = weights_by_season[season]
+            w_ats = weights_ats_by_season[season]
+            equal_w = {c: 0.25 for c in ensemble_mod.COMPONENTS}
+            for rec in season_rows:
+                comps = {c: rec.get(f"{c}_margin") for c in ensemble_mod.COMPONENTS}
+                rec["ensemble_margin"] = ensemble_mod.combine_margin(comps, w)
+                rec["ensemble_ats_margin"] = ensemble_mod.combine_margin(comps, w_ats)
+                rec["ensemble_equal_margin"] = ensemble_mod.combine_margin(comps, equal_w)
+                for f, coeff in coeffs.items():
+                    d = rec.get(f"{f}_diff")
+                    rec[f"feat_{f}_margin"] = (rec["srs_margin"] + coeff * d) if d is not None else None
+                rec["feat_all_margin"] = features_mod.adjusted_margin(
+                    rec["srs_margin"],
+                    {f: rec.get(f"{f}_diff") for f in coeffs}, coeffs)
+            scored_rows.extend(season_rows)
+        train_rows.extend(season_rows)
+    # Summaries (each graded on its own margin key).
+    out: dict = {"weights_by_season": weights_by_season,
+                 "weights_ats_by_season": weights_ats_by_season,
+                 "coeffs_by_season": coeffs_by_season,
+                 "train_fit_by_season": train_fit_by_season}
+    base = summarize(_ats_rows(scored_rows, "srs_margin"), "baseline")
+    out["baseline"] = {k: v for k, v in base.items() if k != "_games"}
+    out["baseline"]["paired_vs_baseline"] = {"n": base["decided"], "paired_delta_pp": 0.0, "paired_z": 0.0}
+    for key, label in (("ensemble_margin", "ensemble_wf"),
+                       ("ensemble_ats_margin", "ensemble_wf_ats"),
+                       ("ensemble_equal_margin", "ensemble_equal"),
+                       ("elo_margin", "component_elo"),
+                       ("epa_margin", "component_epa"),
+                       ("feat_all_margin", "features_all")):
+        s = summarize(_ats_rows(scored_rows, key), label)
+        s["paired_vs_baseline"] = paired_comparison(base["_games"], s["_games"])
+        out[label] = {k: v for k, v in s.items() if k != "_games"}
+    for f in list(features_mod.FEATURES) + list(features_mod.INTERACTIONS):
+        s = summarize(_ats_rows(scored_rows, f"feat_{f}_margin"), f"feature_{f}")
+        s["paired_vs_baseline"] = paired_comparison(base["_games"], s["_games"])
+        out[f"feature_{f}"] = {k: v for k, v in s.items() if k != "_games"}
+    # Market diagnostics: SRS pick on ML-flagged vs unflagged games, and
+    # the ML-implied pick itself (ml margin vs spread) -- a diagnostic
+    # for whether spread/ML disagreement carries signal, not a pick rule.
+    def _ml_stats(rows):
+        dec = [r for r in rows if r.get("ml_margin") is not None
+               and r["actual_margin"] != r["spread_line"]]
+        if not dec:
+            return {"n": 0, "ats_pct": None}
+        corr = sum(1 for r in dec if (r["actual_margin"] > r["spread_line"]) == (r["ml_margin"] > r["spread_line"]))
+        return {"n": len(dec), "ats_pct": round(100 * corr / len(dec), 2)}
+    flagged = [r for r in scored_rows if r["ml_flag"]]
+    unflagged = [r for r in scored_rows if not r["ml_flag"]]
+    out["market"] = {
+        "n": len(scored_rows),
+        "ml_flagged_n": len(flagged),
+        "ml_pick_overall": _ml_stats(scored_rows),
+        "ml_flagged_srs_ats": (lambda d: (round(100 * sum(1 for r in d if (r["actual_margin"] > r["spread_line"]) == (r["srs_margin"] > r["spread_line"])) / len(d), 2) if d else None))(
+            [r for r in flagged if r["actual_margin"] != r["spread_line"]]),
+        "ml_unflagged_srs_ats": (lambda d: (round(100 * sum(1 for r in d if (r["actual_margin"] > r["spread_line"]) == (r["srs_margin"] > r["spread_line"])) / len(d), 2) if d else None))(
+            [r for r in unflagged if r["actual_margin"] != r["spread_line"]]),
+    }
+    out["_rows"] = scored_rows
+    return out
+
+
 def paired_comparison(baseline_games: pd.DataFrame, variant_games: pd.DataFrame) -> dict:
     """Paired (McNemar-style) comparison on the same games, keyed by
     season/week/home/away. Returns discordant counts and a paired z."""
     key = ["season", "week", "home_team", "away_team"]
+    if baseline_games is None or variant_games is None or baseline_games.empty \
+            or variant_games.empty or not all(k in baseline_games.columns for k in key) \
+            or not all(k in variant_games.columns for k in key):
+        # Empty variant (e.g. a feature with no usable data): no paired
+        # comparison is possible, and merging would raise a KeyError.
+        return {"n": 0, "variant_right_base_wrong": 0, "base_right_variant_wrong": 0,
+                "paired_delta_pp": 0.0, "paired_z": 0.0}
     merged = baseline_games.merge(variant_games, on=key, suffixes=("_base", "_var"))
     dec = merged[(merged["ats_base"] != "push") & (merged["ats_var"] != "push")]
     b = int(((dec["ats_var"] == "correct") & (dec["ats_base"] != "correct")).sum())
@@ -289,8 +621,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seasons", default="2019-2025",
                         help="e.g. 2019-2025 or 2024,2025")
     parser.add_argument("--variants", default="baseline",
-                        help="comma-separated variant names from VARIANTS, plus offdef")
+                        help="comma-separated variant names from VARIANTS, plus offdef and "
+                             "ensemble_wf (batch 2; fetches team stats)")
     parser.add_argument("--out", default=None, help="JSON output path (default: stdout)")
+    parser.add_argument("--totals", action="store_true",
+                        help="also run the totals harness (item 8): old blend vs SRS splits, "
+                             "out-of-sample and in-sample, totals-only; does not affect spread variants")
     args = parser.parse_args(argv)
     if "-" in args.seasons:
         lo, hi = args.seasons.split("-", 1)
@@ -302,8 +638,42 @@ def main(argv: list[str] | None = None) -> int:
     names = [v.strip() for v in args.variants.split(",")]
     results: dict[str, dict] = {}
     baseline_games = None
+    # Batch-2 variants need team stats (network fetch, cached per
+    # season). epa_sos uses SOS-EPA ratings; ensemble_wf runs the
+    # full ensemble + feature evaluation instead of evaluate_variant.
+    team_stats_cache: dict[int, pd.DataFrame | None] = {}
+    if any(n in ("epa_sos", "ensemble_wf") for n in names):
+        from . import data as data_mod
+        for s in range(min(seasons) - 2, max(seasons) + 1):
+            try:
+                team_stats_cache[s] = data_mod.load_team_stats(s)
+            except Exception:
+                team_stats_cache[s] = None
+
+    def _sos_epa_fn(season: int, week: int, games_played: dict):
+        cur_full = team_stats_cache.get(season)
+        prior_full = team_stats_cache.get(season - 1)
+        if cur_full is None and prior_full is None:
+            return None
+        sos_cur = epa_mod.sos_epa_ratings(
+            cur_full[pd.to_numeric(cur_full["week"], errors="coerce") < week]
+            if (cur_full is not None and "week" in cur_full.columns) else cur_full)
+        sos_prior = epa_mod.sos_epa_ratings(prior_full)
+        return epa_mod.blend_epa_ratings(
+            sos_cur.get("ratings") or {}, sos_prior.get("ratings") or {}, games_played)
+
+    if args.totals:
+        for label, ins in (("totals_oos", False), ("totals_insample", True)):
+            tot = evaluate_totals(games, seasons, in_sample=ins)
+            results[label] = {k: v for k, v in tot.items() if k != "_games"}
     for name in names:
-        summary = evaluate_variant(games, seasons, name)
+        if name == "ensemble_wf":
+            ens = evaluate_ensemble_and_features(games, seasons, team_stats_cache)
+            ens_rows = ens.pop("_rows", None)
+            results["ensemble_wf"] = ens
+            continue
+        summary = evaluate_variant(games, seasons, name,
+                                   epa_ratings_fn=_sos_epa_fn if name == "epa_sos" else None)
         if name == "baseline":
             baseline_games = summary["_games"]
         if baseline_games is not None and name != "baseline":
