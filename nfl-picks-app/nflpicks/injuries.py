@@ -190,6 +190,39 @@ def _long_term_out_from_roster(depth_df, roster_df, already_seen: set) -> list[t
     return out
 
 
+def qb_change_suggestion(previous_qb: str | None, current_qb: str | None) -> dict:
+    """Review-only QB-change signal (backtest item 5).
+
+    If a team's starting QB name changed from the previous game, return
+    a review-only suggested penalty of config.QB_CHANGE_REVIEW_PTS
+    (1.5 pts). This is a PROXY, not a causal injury effect: the
+    2019-2025 situational study found a ~1-1.7 pt penalty for a QB
+    change / non-season-mode QB that the spread does not fully price,
+    averaged over ALL changes (benchings, rest, backup-to-backup) --
+    not just starter injuries. It is therefore well below the 5.0
+    starter-injury value in POS_VALUE, it is never auto-applied
+    (INJ_AUTO_APPLY stays False), and it must NOT be used as a
+    substitute for the injury-report QB value when a starter is
+    actually OUT/DOUBTFUL (that case is handled by review_injuries).
+    Returns {"suggested_pts": float, "note": str}; 0.0/no-change when
+    either name is missing or they match. Thursday practice
+    participation is already handled in review_injuries (DNP=0.6,
+    LP=0.25 when report_status is empty); this function adds nothing
+    about practice day, because the weekly files carry no day-of-week.
+    """
+    if not previous_qb or not current_qb:
+        return {"suggested_pts": 0.0, "note": ""}
+    if str(previous_qb).strip().upper() == str(current_qb).strip().upper():
+        return {"suggested_pts": 0.0, "note": ""}
+    pts = float(config.QB_CHANGE_REVIEW_PTS)
+    return {
+        "suggested_pts": pts,
+        "note": (f"QB changed ({previous_qb} -> {current_qb}): review-only "
+                 f"{pts} pt suggestion -- situational proxy only, not a "
+                 f"starter-injury value; do not auto-apply."),
+    }
+
+
 def review_injuries(injuries_df: pd.DataFrame | None, week: int, depth_df: pd.DataFrame | None = None,
                      roster_df: pd.DataFrame | None = None) -> dict:
     """
