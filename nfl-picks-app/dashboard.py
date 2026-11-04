@@ -48,6 +48,13 @@ with db.connect() as conn:
         "SELECT * FROM survivor_week_options WHERE season=? ORDER BY week, win_prob DESC",
         conn, params=(config.SEASON,),
     )
+    try:
+        survivor_picks_df = pd.read_sql_query(
+            "SELECT * FROM survivor_picks WHERE season=? ORDER BY strategy, week",
+            conn, params=(config.SEASON,),
+        )
+    except Exception:
+        survivor_picks_df = pd.DataFrame()
     diagnostics_df = pd.read_sql_query("SELECT * FROM run_diagnostics ORDER BY rowid", conn)
     ratings_df = pd.read_sql_query(
         "SELECT * FROM team_ratings_snapshot WHERE season=? ORDER BY week DESC, rating DESC",
@@ -92,11 +99,21 @@ with tab_ats:
         return ""
 
     wk_df["flag"] = wk_df.apply(_flag, axis=1)
-    show = wk_df[["away_team", "home_team", "vegas_spread", "pool_spread", "model_independent", "model_spread",
+    # All spreads in this table stay in nflverse convention
+    # (+ = home favored) so Vegas, Pool, and Model columns are
+    # directly comparable. The pool-line FORM below is the exception:
+    # it accepts sportsbook convention (- = home favored, as printed
+    # by a pool sheet / sportsbook) and converts on save -- see
+    # config.to_nflverse_spread. Do not mix conventions in this table.
+    show_cols = ["away_team", "home_team", "vegas_spread", "pool_spread", "model_independent", "model_spread",
                   "edge", "pick", "confidence", "flag", "injury_flags",
-                  "vegas_total", "pool_total", "model_total", "total_pick", "weather_note"]]
+                  "vegas_total", "pool_total", "model_total", "total_pick", "weather_note"]
+    if "cover_prob" in wk_df.columns:
+        show_cols.insert(10, "cover_prob")
+    show = wk_df[show_cols]
     show.columns = ["Away", "Home", "Vegas Spread", "Pool Spread", "Model Spread (raw)", "Model Spread (official)",
-                     "Edge", "Pick", "Confidence", "Flag", "Injury Flags",
+                     "Edge", "Pick", "Confidence", "Flag"] + (["Cover Prob"] if "cover_prob" in wk_df.columns else []) + [
+                     "Injury Flags",
                      "Vegas Total", "Pool Total", "Model Total", "Total Pick", "Weather"]
     st.dataframe(show, use_container_width=True, hide_index=True)
     st.caption(
@@ -109,12 +126,22 @@ with tab_ats:
         "only affects the Total (dome games are blank) -- it's not applied to the spread, since the "
         "research support for that is much weaker than for total scoring. \"Pool Spread\"/\"Pool Total\" "
         "are blank unless you set an override below -- when set, THAT line (not live Vegas) drives the "
-        "Edge and Pick, since that's what you're actually judged against."
+        "Edge and Pick, since that's what you're actually judged against. "
+        "All spreads in the table above are nflverse convention (+ = home favored). "
+        "Cover Prob is the model's estimated probability the pick covers, "
+        "from the raw model-vs-line gap -- near 50% means a coin flip, "
+        "which matters when the same picks count for both a weekly winner "
+        "and the season-long winner (see README)."
     )
 
     st.divider()
     st.markdown("**Set a pool line** (when your pool locked a different line than the live one above)")
-    st.caption("Leave a field blank to use the live Vegas line for that number.")
+    st.caption("Enter the spread EXACTLY as your pool sheet / sportsbook prints it: "
+               "negative if the HOME team is favored (e.g. -3.5), positive if the AWAY team is favored. "
+               "This form converts it to the app's internal nflverse convention on save -- "
+               "entering it the other way used to silently flip the pick. "
+               "Leave a field blank to use the live Vegas line for that number. "
+               "Overrides saved before Nov 4, 2026 were stored unconverted, so re-enter any old override.")
     wk_games = wk_df[["away_team", "home_team"]].copy()
     wk_games["matchup"] = wk_games["away_team"] + " @ " + wk_games["home_team"]
     with st.form("pool_line_form"):
@@ -124,7 +151,7 @@ with tab_ats:
         # if left blank -- avoids the checkbox+disabled trick above, which
         # doesn't work inside a form (form widgets don't rerun live, so a
         # checkbox can never actually unlock another widget before submit).
-        pool_spread_in = c1.number_input("Pool Spread (home team)", value=None, step=0.5, format="%.1f")
+        pool_spread_in = c1.number_input("Pool Spread, sportsbook style (home team: - = home favored)", value=None, step=0.5, format="%.1f")
         pool_total_in = c2.number_input("Pool Total", value=None, step=0.5, format="%.1f")
         col_save, col_clear = st.columns(2)
         save_clicked = col_save.form_submit_button("Save pool line")
@@ -138,12 +165,15 @@ with tab_ats:
             elif pool_spread_in is None and pool_total_in is None:
                 st.warning("Enter a Pool Spread and/or Pool Total first, or use Clear instead.")
             else:
-                db.set_pool_line_override(config.SEASON, latest_week, home, away, pool_spread_in, pool_total_in)
+                # Convert sportsbook -> nflverse on save. DB stores nflverse.
+                pool_spread_db = config.to_nflverse_spread(pool_spread_in) if pool_spread_in is not None else None
+                db.set_pool_line_override(config.SEASON, latest_week, home, away, pool_spread_db, pool_total_in)
                 st.success(f"Saved pool line for {matchup}. Click Refresh Picks Now to recompute the edge/pick with it.")
                 st.rerun()
     if not pool_lines_df.empty:
-        st.caption("Active pool line overrides: " + ", ".join(
-            f"{r.away_team}@{r.home_team} (spread {r.pool_spread}, total {r.pool_total})"
+        # Show overrides back in sportsbook style, as the user entered them.
+        st.caption("Active pool line overrides (sportsbook style): " + ", ".join(
+            f"{r.away_team}@{r.home_team} (spread {config.to_sportsbook_spread(r.pool_spread) if pd.notna(r.pool_spread) else r.pool_spread}, total {r.pool_total})"
             for r in pool_lines_df.itertuples()
         ))
 
@@ -180,6 +210,22 @@ with tab_survivor:
                 "stronger team for a tougher matchup later -- this view intentionally doesn't do that "
                 "trade-off for you, since you said you'd rather pick from the full list yourself."
             )
+
+    # FIXED 2026-11-04: the optimizer's full-season plan was computed
+    # and saved to survivor_picks every run, but this tab never read
+    # that table -- the plan was invisible in the UI.
+    if not survivor_picks_df.empty:
+        st.divider()
+        st.markdown("**Season-long optimizer plan** (maximizes survival probability across all remaining weeks)")
+        for strategy in ["optimizer", "greedy"]:
+            plan = survivor_picks_df[survivor_picks_df["strategy"] == strategy]
+            if plan.empty:
+                continue
+            st.caption(f"Strategy: {strategy}")
+            plan_show = plan[["week", "recommended_team", "opponent", "is_home", "win_prob", "survival_prob_to_here"]].copy()
+            plan_show["is_home"] = plan_show["is_home"].map({1: "home", 0: "away"})
+            plan_show.columns = ["Week", "Team", "Opponent", "Home/Away", "Win Prob", "Survival Prob To Here"]
+            st.dataframe(plan_show, hide_index=True, use_container_width=True)
 
     st.divider()
     st.markdown("**Mark a team as used** (once you've actually made that week's pick)")
@@ -318,7 +364,11 @@ with tab_grades:
 with tab_adjust:
     st.subheader("Manual Adjustments")
     st.caption("Your call on injuries, weather, or anything else the model doesn't see. "
-               "These feed directly into next run's ratings and are logged to Decision Log.")
+               "These feed directly into next run's ratings and are logged to Decision Log. "
+               "Note: on Streamlit Cloud these live in that deployment's database only -- "
+               "a redeploy can lose them. The GitHub Action workflow commits the "
+               "runner's database back to the repo, but it cannot commit adjustments "
+               "made inside a Cloud deployment. Keep a note of important adjustments.")
     st.dataframe(adj_df, hide_index=True, use_container_width=True)
 
     with st.form("add_adjustment"):
