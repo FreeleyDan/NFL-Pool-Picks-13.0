@@ -98,6 +98,19 @@ CREATE TABLE IF NOT EXISTS pool_line_overrides (
     pool_spread REAL, pool_total REAL, updated_at TEXT,
     PRIMARY KEY (season, week, home_team, away_team)
 );
+
+-- Line movement (backtest item 7, added 2026-11-04): one snapshot row
+-- per game per source per run. Sources: 'pool' = the pool's locked line
+-- (pool_line_overrides at run time), 'closing' = the recorded/live
+-- vegas_spread saved with that week's picks. Comparing the two is how
+-- the dashboard flags edge flips and >1 pt moves for Thursday review.
+-- The pool line is NEVER auto-switched: it is what the user is judged
+-- against, so a move only ever produces a review flag.
+CREATE TABLE IF NOT EXISTS line_snapshots (
+    season INTEGER, week INTEGER, home_team TEXT, away_team TEXT,
+    source TEXT, line REAL, run_time TEXT,
+    PRIMARY KEY (season, week, home_team, away_team, source)
+);
 """
 
 
@@ -229,6 +242,63 @@ def get_recent_injury_history(season: int, current_week: int, lookback_weeks: in
             (season, current_week, max(1, current_week - lookback_weeks)),
         ).fetchall()
     return rows
+
+
+def save_line_snapshot(season: int, week: int, home_team: str, away_team: str,
+                       source: str, line: float | None, db_path: str | None = None):
+    """Save (or replace) one line snapshot. `line` is in nflverse
+    convention (+ = home favored), matching picks.vegas_spread and
+    pool_line_overrides as stored. A None line is a no-op."""
+    if line is None:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO line_snapshots (season, week, home_team, away_team, source, line, run_time) "
+            "VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(season, week, home_team, away_team, source) DO UPDATE SET "
+            "line=excluded.line, run_time=excluded.run_time",
+            (season, week, home_team, away_team, source, float(line), datetime.utcnow().isoformat()),
+        )
+
+
+def get_line_moves(season: int, week: int, db_path: str | None = None,
+                   move_threshold: float = 1.0) -> list[dict]:
+    """Games where the pool line and the closing/live line disagree
+    enough to warrant Thursday-morning review: movement >=
+    `move_threshold` points, OR the model edge flips sign between the
+    two lines (model_independent from picks is used for the edge).
+    Returns rows sorted by movement descending. A flagged game is a
+    manual check (injury/news the market learned), never an
+    auto-switch: the pool line stays the judged line."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT p.home_team, p.away_team, p.model_independent, "
+            "pool.line AS pool_line, close.line AS closing_line "
+            "FROM picks p "
+            "LEFT JOIN line_snapshots pool ON pool.season=p.season AND pool.week=p.week "
+            "  AND pool.home_team=p.home_team AND pool.away_team=p.away_team AND pool.source='pool' "
+            "LEFT JOIN line_snapshots close ON close.season=p.season AND close.week=p.week "
+            "  AND close.home_team=p.home_team AND close.away_team=p.away_team AND close.source='closing' "
+            "WHERE p.season=? AND p.week=?",
+            (season, week)).fetchall()
+    out = []
+    for r in rows:
+        pool_line, closing_line, model = r["pool_line"], r["closing_line"], r["model_independent"]
+        if pool_line is None or closing_line is None or model is None:
+            continue
+        movement = abs(closing_line - pool_line)
+        edge_pool = model - pool_line
+        edge_close = model - closing_line
+        edge_flip = (edge_pool == 0 or edge_close == 0) or (edge_pool > 0) != (edge_close > 0)
+        if movement >= move_threshold or edge_flip:
+            out.append({
+                "home_team": r["home_team"], "away_team": r["away_team"],
+                "pool_line": pool_line, "closing_line": closing_line,
+                "movement": round(movement, 2), "model_independent": model,
+                "edge_pool": round(edge_pool, 2), "edge_close": round(edge_close, 2),
+                "edge_flip": bool(edge_flip),
+            })
+    return sorted(out, key=lambda d: -d["movement"])
 
 
 def save_injury_returns(season: int, week: int, detail: list[tuple], db_path: str | None = None):
