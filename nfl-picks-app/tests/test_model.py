@@ -61,7 +61,10 @@ class TestEdgeFlags(unittest.TestCase):
 
 class TestDivGame(unittest.TestCase):
     def test_div_game_forms(self):
-        # int, str, float, and bool 1 must all get the 0.9 multiplier.
+        # int, str, float, and bool 1 must all get the divisional multiplier.
+        # DIV_MULTIPLIER stays 0.9 (see config.py): harness ablation
+        # div09 vs div1 was noise (paired z=1.13), so the original value
+        # is kept rather than changed on weak evidence.
         for div in (1, "1", 1.0, True):
             p = model.predict_game(row("KC", "DEN", 3.0, div=div), RATINGS, GP, 2.0)
             self.assertEqual(p.margin_model, 10.8, div)  # (5 - -5 + 2) * 0.9
