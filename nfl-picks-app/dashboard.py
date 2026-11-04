@@ -7,7 +7,7 @@ import traceback
 import pandas as pd
 import streamlit as st
 
-from nflpicks import config, db, grading
+from nflpicks import adjustment_grading, config, db, grading, review_queue, standings, submission
 import weekly_run
 
 st.set_page_config(page_title="NFL Pool Picks", layout="wide")
@@ -67,7 +67,7 @@ with db.connect() as conn:
         "SELECT * FROM pool_line_overrides WHERE season=?", conn, params=(config.SEASON,)
     )
 
-tab_names = ["ATS Picks", "Survivor Pool", "Injury Review", "Model Grades", "Manual Adjustments", "Data Health"]
+tab_names = ["ATS Picks", "Submit & Review", "Survivor Pool", "Injury Review", "Model Grades", "Manual Adjustments", "Data Health"]
 if picks_df.empty:
     st.info("No picks yet -- click \"🔄 Refresh Picks Now\" above to pull data and generate this week's picks. "
             "If it stays empty after refreshing, check the Data Health tab below.")
@@ -84,7 +84,7 @@ if picks_df.empty:
     st.stop()
 
 latest_week = int(picks_df["week"].max())
-tab_ats, tab_survivor, tab_injuries, tab_grades, tab_adjust, tab_health = st.tabs(tab_names)
+tab_ats, tab_submit, tab_survivor, tab_injuries, tab_grades, tab_adjust, tab_health = st.tabs(tab_names)
 
 # ---- ATS Picks ----
 with tab_ats:
@@ -198,6 +198,125 @@ with tab_ats:
             f"{r.away_team}@{r.home_team} (spread {config.to_sportsbook_spread(r.pool_spread) if pd.notna(r.pool_spread) else r.pool_spread}, total {r.pool_total})"
             for r in pool_lines_df.itertuples()
         ))
+
+# ---- Submit & Review (items 3 + 7b + standings wiring) ----
+with tab_submit:
+    st.subheader(f"Week {latest_week} — Submit & Thursday Review")
+    wk_submit = picks_df[picks_df["week"] == latest_week].copy()
+
+    # 7b -- workflow run status, from data the app can actually read.
+    # This is the last run saved in THIS database (picks.run_time +
+    # run_diagnostics), NOT a live GitHub Actions status: the Actions
+    # API needs a token the app does not have, so no live status is
+    # claimed. For live status, check the Actions tab on GitHub.
+    st.markdown("**Last run (from this database, not live Actions status)**")
+    run_times = wk_submit["run_time"].dropna() if "run_time" in wk_submit.columns else pd.Series([], dtype=str)
+    if not run_times.empty:
+        st.write(f"Latest week {latest_week} picks saved at: {run_times.max()} "
+                 f"({len(wk_submit)} games). If this timestamp is older than the last "
+                 "Tuesday/Thursday 15:00 UTC workflow run, the workflow may have failed -- "
+                 "check the Actions tab on GitHub (a failing unit test now fails the job "
+                 "before any pick is computed).")
+    else:
+        st.write("No run timestamp recorded for this week yet.")
+    if not diagnostics_df.empty:
+        failed = diagnostics_df[diagnostics_df["ok"] == 0]
+        if not failed.empty:
+            st.warning("Last run reported failures: " + "; ".join(
+                f"{r.step}: {r.detail}" for r in failed.itertuples()))
+        else:
+            st.caption("Last run diagnostics: all steps OK (see Data Health for detail).")
+
+    # 3a -- submission sheet.
+    st.divider()
+    st.markdown("**Submission sheet — copy-paste for Barbara's pool email**")
+    st.caption("Picks are due Thursday 11:00 AM PT by replying to Barbara's email. "
+               "Lines below are in sportsbook notation, exactly as a pool sheet prints them "
+               "(home favorite = negative), derived from the stored pool line where set, "
+               "else the live Vegas line -- and double-checked against the model's own pick "
+               "string, so a flipped sign shows up as a MISMATCH instead of a silent error.")
+    sub_inputs = []
+    for r in wk_submit.itertuples():
+        pool_sp = r.pool_spread if pd.notna(getattr(r, "pool_spread", None)) else None
+        veg_sp = r.vegas_spread if pd.notna(getattr(r, "vegas_spread", None)) else None
+        sub_inputs.append({"home": r.home_team, "away": r.away_team, "pick": r.pick,
+                           "pool_spread": pool_sp, "vegas_spread": veg_sp})
+    sheet = submission.build_submission_sheet(sub_inputs, latest_week)
+    st.code(sheet["text"])
+    st.markdown("**Checklist — do not send until every check passes (except the manual one)**")
+    for c in sheet["checklist"]:
+        icon = {"pass": "✅", "fail": "❌", "manual": "✏️"}.get(c["status"], "")
+        st.write(f"{icon} **{c['check']}** — {c['detail']}")
+    mismatches = [e for e in sheet["entries"] if e["sign_check"] == "MISMATCH"]
+    if mismatches:
+        st.error("Sign MISMATCH on: " + ", ".join(
+            f"{e['matchup']} (derived {e['pick_text']}, model {e['model_pick']})" for e in mismatches)
+        + " -- do not send until this is resolved.")
+
+    # 3b -- Thursday review queue: flagged games only, P1 first.
+    st.divider()
+    st.markdown("**Thursday review queue — flagged games only**")
+    try:
+        queue = review_queue.build_review_queue(config.SEASON, latest_week)
+    except Exception:
+        queue = {"items": [], "note": "Could not build the review queue from this database."}
+        st.error("Could not build the review queue -- see the error below, or check the ATS tab's line-moves section.")
+        st.code(traceback.format_exc())
+    st.caption(queue["note"])
+    if queue["items"]:
+        q_rows = [{"Priority": f"P{i['priority']}", "Matchup": i["matchup"], "Pick": i["pick"],
+                   "Model vs line (pts)": i["raw_deviation"], "Line move (pts)": i["line_movement"],
+                   "Why flagged": " | ".join(i["reasons"])} for i in queue["items"]]
+        st.dataframe(q_rows, hide_index=True, use_container_width=True)
+    else:
+        st.write("No games flagged this week -- nothing in the queue means nothing met a flag "
+                 "threshold, not that the data was checked and cleared.")
+
+    # Standings wiring (batch 3 API, previously unwired): labels only.
+    # The default picks are unchanged by anything here; a GAMBLE label
+    # is a suggestion to flip, not a changed pick.
+    st.divider()
+    st.markdown("**Standings check — late-season gamble labels (label-only)**")
+    st.caption("Enter your actual season ATS wins and the leader's, plus weeks left INCLUDING "
+               "this week (final week = 1). Early in the season (5+ weeks left) the rule is "
+               "off no matter the standings. Full-season simulation costing "
+               "(simulation.compare_gambles) is NOT run here: it needs cover probabilities "
+               "for the whole remaining schedule, and this database stores only this week's "
+               "picks -- see README for where that wiring goes. The expected-win cost shown "
+               "with each GAMBLE comes from standings.suggest_gambles itself.")
+    with st.form("standings_form"):
+        sc1, sc2, sc3 = st.columns(3)
+        user_wins_in = sc1.number_input("Your season ATS wins", value=0, min_value=0, step=1)
+        leader_wins_in = sc2.number_input("Leader's season ATS wins", value=0, min_value=0, step=1)
+        weeks_left_in = sc3.number_input("Weeks left (incl. this week)", value=4, min_value=0, step=1)
+        standings_clicked = st.form_submit_button("Check standings labels")
+    if standings_clicked:
+        s_games, skipped = [], []
+        for r in wk_submit.itertuples():
+            if pd.isna(getattr(r, "cover_prob", None)):
+                skipped.append(f"{r.away_team}@{r.home_team} (no cover prob)")
+                continue
+            pick_team = submission.pick_team_from_pick_string(r.pick, r.home_team, r.away_team)
+            if pick_team is None:
+                skipped.append(f"{r.away_team}@{r.home_team} (no pick)")
+                continue
+            s_games.append({"home": r.home_team, "away": r.away_team,
+                            "default_side": "home" if pick_team == r.home_team else "away",
+                            "pick_prob": float(r.cover_prob)})
+        try:
+            s_out = standings.suggest_gambles(s_games, int(user_wins_in), int(leader_wins_in),
+                                              int(weeks_left_in))
+            st.write(s_out["note"])
+            s_rows = [{"Matchup": f"{g['away']} @ {g['home']}", "Default": g["default_side"],
+                       "Pick prob": g["pick_prob"], "Label": g["label"],
+                       "Gamble side": g["gamble_side"], "Expected cost (wins)": g["expected_cost"],
+                       "Reason": g["reason"]} for g in s_out["games"]]
+            st.dataframe(s_rows, hide_index=True, use_container_width=True)
+            if skipped:
+                st.caption("Skipped (no cover prob or no pick): " + "; ".join(skipped))
+        except Exception:
+            st.error("Standings check failed -- check the inputs (all must be non-negative).")
+            st.code(traceback.format_exc())
 
 # ---- Survivor ----
 with tab_survivor:
@@ -381,6 +500,37 @@ with tab_grades:
         st.write("No graded games yet -- click the button above once some of this week's games have finished.")
     else:
         st.dataframe(grades_df, hide_index=True, use_container_width=True)
+
+    # 7c -- manual adjustments graded separately from model picks.
+    st.divider()
+    st.markdown("**Manual adjustments vs model picks**")
+    st.caption(
+        "\"Adjusted\" means a manual adjustment was active for that game at pick time -- "
+        "it does NOT mean the adjustment flipped the pick (that would need a counterfactual "
+        "re-run without adjustments). Pushes are excluded from ATS%, same as model grades. "
+        "A small sample (one week) proves nothing; judge overrides over a season.")
+    saved_adj = adjustment_grading.load_adjustment_grades(config.SEASON)
+    if saved_adj:
+        st.dataframe(saved_adj, hide_index=True, use_container_width=True)
+    if st.button("📊 Grade Manual Adjustments Now"):
+        with st.spinner("Pulling actual results and grading adjusted vs unadjusted games..."):
+            try:
+                from nflpicks import data as _data
+                _games = _data.load_games(config.SEASON)
+                _results = {(int(r["season"]), int(r["week"]), r["away_team"], r["home_team"]): float(r["result"])
+                            for _, r in _games[_games["result"].notna()].iterrows()}
+                _summary = adjustment_grading.grade_season_from_db(config.SEASON, _results)
+                adjustment_grading.save_adjustment_grades(_summary)
+                st.success(f"Adjusted: {_summary['adjusted']['record']} "
+                           f"({_summary['adjusted']['ats_pct']}% ATS, {_summary['adjusted']['games']} games, "
+                           f"{_summary['adjusted']['pushes']} pushes) | Unadjusted: "
+                           f"{_summary['unadjusted']['record']} ({_summary['unadjusted']['ats_pct']}% ATS, "
+                           f"{_summary['unadjusted']['games']} games, {_summary['unadjusted']['pushes']} pushes) | "
+                           f"Ungraded (no result yet): {_summary['ungraded']}.")
+            except Exception:
+                st.error("Something went wrong while grading adjustments. Error detail:")
+                st.code(traceback.format_exc())
+        st.rerun()
 
 # ---- Manual adjustments ----
 with tab_adjust:
