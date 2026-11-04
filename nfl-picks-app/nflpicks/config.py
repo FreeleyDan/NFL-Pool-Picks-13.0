@@ -40,7 +40,13 @@ HFA_MIN = 0.5
 HFA_MAX = 3.0
 
 # ---- Edge / confidence ----
-EDGE_THRESHOLD = 3.0     # flag games where model vs Vegas gap >= this
+# NOTE (fixed 2026-11-04): EDGE_THRESHOLD / SANITY_EDGE_FLAG are applied
+# to the model's RAW deviation from the line (model_independent - line),
+# NOT to the market-blended edge shown in the dashboard. The blended edge
+# is only 13.5%-30% of the raw deviation, so applying these thresholds to
+# it meant "strong edge" needed a 10-22 point deviation and "needs review"
+# needed 27-59 points -- neither ever fired in practice. See model.py.
+EDGE_THRESHOLD = 3.0     # flag games where model vs Vegas gap >= this (raw deviation)
 MIN_GAMES_FOR_FULL_CONFIDENCE = 4  # below this many current-season games, confidence is down-weighted
 # Confidence never floors at 0 even with zero current-season games -- last
 # season's regressed rating is still real evidence. This is the floor value
@@ -200,3 +206,22 @@ TEAM_MAP = {
 def normalize_team(team: str) -> str:
     t = str(team or "").strip().upper()
     return TEAM_MAP.get(t, t)
+
+
+# ---- Spread sign conventions (fixed 2026-11-04) ----
+# nflverse's spread_line is HOME-perspective: positive = home favored,
+# negative = away favored. Sportsbooks print the opposite: a home
+# favorite is "-3.5", an away favorite is "+3.5" for the home team.
+# Everything inside this app (model, DB, grading) stores the NFLVERSE
+# convention. The dashboard is the ONLY boundary that speaks sportsbook
+# convention to the user, and it must convert both ways with these
+# helpers -- entering a sportsbook line directly into the DB used to
+# silently flip the pick.
+def to_nflverse_spread(sportsbook_spread: float) -> float:
+    """Sportsbook line (home team: -3.5 = home favored) -> nflverse line."""
+    return -float(sportsbook_spread)
+
+
+def to_sportsbook_spread(nflverse_spread: float) -> float:
+    """nflverse line (positive = home favored) -> sportsbook line."""
+    return -float(nflverse_spread)
