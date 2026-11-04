@@ -134,6 +134,28 @@ with tab_ats:
         "and the season-long winner (see README)."
     )
 
+    # Line-movement review (backtest item 7, added 2026-11-04): games
+    # where the pool line and the closing/live line moved >=1 pt or the
+    # model edge flips between them. This is a manual Thursday-morning
+    # check only -- the pool line is NEVER auto-switched, since it is
+    # what the pool is judged against. Snapshots are written by
+    # weekly_run.py (pool) and by picks saves (closing); until both
+    # exist for a week this section is simply empty, not an error.
+    try:
+        from nflpicks import db as _db
+        _moves = _db.get_line_moves(config.SEASON, latest_week)
+    except Exception:
+        _moves = []
+    if _moves:
+        st.divider()
+        st.markdown("**⚠️ Line moves to review Thursday morning**")
+        st.caption(
+            "Pool line vs closing/live line moved >= 1 pt, or the model edge "
+            "flips sign between them. Check for injury/news the market "
+            "learned since the pool line locked -- do NOT auto-switch: "
+            "the pool line is what you are judged against.")
+        st.dataframe(_moves, use_container_width=True, hide_index=True)
+
     st.divider()
     st.markdown("**Set a pool line** (when your pool locked a different line than the live one above)")
     st.caption("Enter the spread EXACTLY as your pool sheet / sportsbook prints it: "
