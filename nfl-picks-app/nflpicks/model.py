@@ -10,7 +10,7 @@ import math
 
 import pandas as pd
 
-from . import config, ratings as ratings_mod
+from . import calibration, config, ratings as ratings_mod
 
 
 @dataclass
@@ -38,14 +38,48 @@ class GamePrediction:
     pool_spread: float | None = None   # your pool's locked spread, NFLVERSE convention (see config)
     pool_total: float | None = None    # your pool's locked total, if you set one (drives the total pick)
     total_pick: str | None = None
-    cover_prob: float | None = None    # P(pick covers), normal approx. with SURVIVOR_SPREAD_STDEV
+    cover_prob: float | None = None    # P(pick covers), calibrated empirical (calibration.py)
 
 
 def _rest_adjustment(home_rest, away_rest) -> float:
+    # Kept as a margin predictor, NOT raised on ATS-residual evidence:
+    # 2019-2025 ATS residual slope is -0.03 +/- 0.12 pts/day (vs this
+    # 0.25/day), which means the market already prices rest -- raising
+    # it would create false edges, not real ones. Bye / short-week
+    # extras are likewise NOT added: pooled bye residual was -0.83
+    # (wrong sign, n.s.) and one-sided short-week contrasts had n=0.
     if pd.isna(home_rest) or pd.isna(away_rest):
         return 0.0
     diff = float(home_rest) - float(away_rest)
-    return max(-2.0, min(2.0, diff * 0.25))
+    cap = getattr(config, "REST_CAP", 2.0)
+    per_day = getattr(config, "REST_POINTS_PER_DAY", 0.25)
+    return max(-cap, min(cap, diff * per_day))
+
+
+def _travel_adjustment(home: str, away: str) -> float:
+    """Travel adjustment, OFF by default (config.TRAVEL_ENABLED=False).
+
+    Long-travel away teams beat the spread in 2019-2025, but the effect
+    is driven by 2019-2020 and inconsistent by season, so it is a
+    harness diagnostic only, not a live adjustment. Distance is
+    haversine between home stadiums (a proxy for origin -- it ignores
+    road-trip sequencing), in favour of the travelling (away) team:
+    positive return means the away team's margin improves.
+    """
+    if not getattr(config, "TRAVEL_ENABLED", False):
+        return 0.0
+    coords = config.STADIUM_COORDS
+    if home not in coords or away not in coords:
+        return 0.0
+    lat1, lon1 = coords[away]
+    lat2, lon2 = coords[home]
+    # Haversine, miles.
+    import math as _math
+    rlat1, rlon1, rlat2, rlon2 = (_math.radians(v) for v in (lat1, lon1, lat2, lon2))
+    a = (_math.sin((rlat2 - rlat1) / 2) ** 2
+         + _math.cos(rlat1) * _math.cos(rlat2) * _math.sin((rlon2 - rlon1) / 2) ** 2)
+    miles = 3959 * 2 * _math.asin(_math.sqrt(a))
+    return miles / 1000.0 * getattr(config, "TRAVEL_POINTS_PER_1000MI", 0.0)
 
 
 def _is_div_game(value) -> bool:
@@ -66,12 +100,13 @@ def _is_neutral(location) -> bool:
 
 
 def _cover_probability(independent: float, line: float) -> float:
-    # P(home covers) under a normal approx. for (actual margin - model
-    # margin) with the same stdev the survivor model uses. The pick's
-    # cover probability is max(p, 1-p) in the caller; this returns the
-    # home-side probability so the direction is unambiguous.
-    z = (independent - line) / config.SURVIVOR_SPREAD_STDEV
-    return round(0.5 * (1 + math.erf(z / math.sqrt(2))), 3)
+    # CHANGED 2026-11-04 (backtest item 2): calibrated empirical cover
+    # probability (calibration.py), not the old normal/13.5 approx.
+    # The normal approx. treated the raw model margin as calibrated 1:1;
+    # backtest regression is actual ~= 0.36 + 0.68 * model, so raw edges
+    # were overstated. This returns the home-side probability so the
+    # direction is unambiguous; the caller converts it to the pick side.
+    return calibration.cover_probability_home(independent, line)
 
 
 def predict_game(
@@ -101,10 +136,15 @@ def predict_game(
     r_away = team_ratings.get(away, 0.0) + manual_adj.get(away, 0.0) + inj_a
 
     rest_adj = _rest_adjustment(row.get("home_rest"), row.get("away_rest"))
-    div_mult = 0.9 if _is_div_game(row.get("div_game")) else 1.0
+    # Divisional multiplier is now config.DIV_MULTIPLIER (1.0 since
+    # 2026-11-04; the old hardcoded 0.9 was not supported by backtest).
+    div_mult = getattr(config, "DIV_MULTIPLIER", 1.0) if _is_div_game(row.get("div_game")) else 1.0
     effective_hfa = 0.0 if _is_neutral(row.get("location")) else hfa
+    # Travel is OFF by default (config.TRAVEL_ENABLED=False); when
+    # enabled it favours the travelling away team (see _travel_adjustment).
+    travel_adj = _travel_adjustment(home, away)
 
-    margin_model = (r_home - r_away + effective_hfa + rest_adj) * div_mult
+    margin_model = (r_home - r_away + effective_hfa + rest_adj - travel_adj) * div_mult
 
     epa_model = None
     if epa_ratings and home in epa_ratings and away in epa_ratings:
@@ -159,15 +199,27 @@ def predict_game(
     cover_prob = None
     pick = None
     if edge is not None:
-        home_cover = _cover_probability(independent, line_for_pick)
-        cover_prob = home_cover if edge > 0 else round(1 - home_cover, 3)
+        # Default (CALIBRATED_PICK=False): pick follows the deviation
+        # sign, as before; cover_prob is the calibrated probability
+        # that side covers, and it may be <0.5 -- that honestly flags
+        # a pick that is not actually favoured after shrinkage.
+        # With CALIBRATED_PICK=True (harness only, OFF by default):
+        # pick by shrunk margin vs line instead.
+        if getattr(config, "CALIBRATED_PICK", False):
+            pick_side_home = calibration.shrunk_margin(independent) > line_for_pick
+            cover_prob = calibration.cover_probability_for_pick(independent, line_for_pick)
+            edge_sign = 1 if pick_side_home else -1
+        else:
+            home_cover = _cover_probability(independent, line_for_pick)
+            cover_prob = home_cover if edge > 0 else round(1 - home_cover, 3)
+            edge_sign = 1 if edge > 0 else -1
         if edge == 0:
             cover_prob = 0.5
         if line_for_pick == 0:
-            pick = f"{home if edge > 0 else away} PK"
+            pick = f"{home if edge_sign > 0 else away} PK"
         else:
-            fav_team = home if edge > 0 else away
-            line = line_for_pick if edge > 0 else -line_for_pick
+            fav_team = home if edge_sign > 0 else away
+            line = line_for_pick if edge_sign > 0 else -line_for_pick
             sign = "-" if line > 0 else "+"
             pick = f"{fav_team} {sign}{abs(line):g}"
 
@@ -326,7 +378,7 @@ def predict_full_schedule(
         r_home = team_ratings.get(home, 0.0)
         r_away = team_ratings.get(away, 0.0)
         rest_adj = _rest_adjustment(row.get("home_rest"), row.get("away_rest"))
-        div_mult = 0.9 if _is_div_game(row.get("div_game")) else 1.0
+        div_mult = getattr(config, "DIV_MULTIPLIER", 1.0) if _is_div_game(row.get("div_game")) else 1.0
         effective_hfa = 0.0 if _is_neutral(row.get("location")) else hfa
         model_margin = (r_home - r_away + effective_hfa + rest_adj) * div_mult
         rows.append({
