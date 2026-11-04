@@ -22,10 +22,36 @@ nflpicks/
   survivor.py   season-long survivor pool optimizer (assignment problem)
   grading.py    walk-forward grading of each model variant vs. actual results
   db.py         SQLite storage (one table per old spreadsheet tab)
-weekly_run.py   the weekly job: pulls data, predicts, saves, emails
+weekly_run.py   the weekly job: pulls data, predicts, saves (email is opt-in only)
 dashboard.py    Streamlit UI -- this replaces the spreadsheet as your daily view
-.github/workflows/weekly.yml   free scheduled runs via GitHub Actions
+.github/workflows/weekly.yml   free scheduled runs via GitHub Actions (at repo root)
+tests/          unit tests for the bug fixes -- python -m unittest discover -s tests
 ```
+
+## Spread conventions -- read this before entering a pool line
+
+Everything inside the app uses nflverse convention: spread_line is
+home-perspective, positive = home favored, negative = away favored.
+Sportsbooks and pool sheets print the opposite: a home favorite is
+"-3.5". The dashboard's pool-line form accepts sportsbook convention
+and converts it on save (`config.to_nflverse_spread`); the ATS table
+itself stays in nflverse convention so all its spread columns are
+directly comparable. Entering a sportsbook line directly into the
+database used to silently flip the pick -- that was fixed 2026-11-04.
+Overrides saved before that date were stored unconverted: re-enter them.
+
+## Weekly winner AND season-long winner
+
+This pool pays both, and the same picks count for both, so there is
+no separate weekly pick set to generate. The default is the
+season-maximizing choice: pick the side with the highest estimated
+cover probability on every game. The dashboard's Cover Prob column
+shows how close each pick is to a coin flip. For the weekly prize
+alone, variance helps -- a contrarian pick on a coin-flip game can
+separate you from the field for that week -- but it costs expected
+season points on average. Use Cover Prob to decide where a weekly
+gamble is cheap (near 50%) vs. expensive (a strong lean you'd be
+throwing away).
 
 ## Local setup
 
@@ -41,22 +67,32 @@ Set `PICKS_SEASON` as an env var if you're not on the current default season
 ## Automating it (no server required)
 
 1. **Push this repo to GitHub** (private repo is fine, free).
-2. **Add repo secrets** (Settings → Secrets and variables → Actions):
-   - `PICKS_EMAIL` — where the weekly summary goes
-   - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` — for
-     email. Gmail: use an [app password](https://myaccount.google.com/apppasswords),
-     host `smtp.gmail.com`, port `587`. If you skip these, the job still runs
-     and updates the dashboard — it just won't email you.
-3. The workflow in `.github/workflows/weekly.yml` runs every Tuesday
-   (after lines post), grades last week, predicts next week, and commits
-   the updated `nfl_picks.db` back to the repo. You can also trigger it
-   manually from the Actions tab any time.
+2. **No email setup needed.** The workflow does not send email, and
+   `weekly_run.py` skips email entirely when `SMTP_HOST` is unset.
+   Email is opt-in only: if you ever want it back, set `SMTP_HOST`,
+   `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM` (Gmail: use an
+   [app password](https://myaccount.google.com/apppasswords), host
+   `smtp.gmail.com`, port `587`). An email failure can no longer abort
+   the run or block the database commit.
+3. The workflow in `.github/workflows/weekly.yml` (at the repo root,
+   not inside `nfl-picks-app/`) runs Tuesday and Thursday at 15:00 UTC
+   (7 AM PT in winter). Thursday's run is the one that matters: picks
+   are due Thursday at 11:00 AM PT, so Thursday morning catches the
+   latest lines and practice reports. It grades completed games,
+   predicts the next week, and commits the updated `nfl_picks.db`
+   back to the repo (force-added, since `*.db` is gitignored for
+   local dev). You can also trigger it manually from the Actions tab
+   any time.
 
 ## Getting the dashboard on your phone
 
 1. Go to [share.streamlit.io](https://share.streamlit.io), sign in with
-   GitHub, and point it at this repo + `dashboard.py`. Free tier is plenty
-   for personal use.
+   GitHub, and point it at this repo + `nfl-picks-app/dashboard.py`
+   (not the repo root -- the app lives in that subfolder). Free tier is
+   plenty for personal use. Note: manual adjustments made inside a
+   Streamlit Cloud deployment live in that deployment's database only
+   and can be lost on redeploy -- the GitHub Action cannot commit them
+   back. Keep a note of important adjustments.
 2. Since the GitHub Action commits `nfl_picks.db` back to the repo each
    week, Streamlit Cloud will pick up fresh data automatically on its next
    redeploy (it redeploys on every push to the repo).
@@ -80,6 +116,9 @@ then check the **Model Grades** tab in the dashboard. Only flip
 `config.EPA_LIVE = True` if the EPA or combo variant's MAE beats the
 margin model's, and/or its ATS% clears ~52.4% (break-even against
 standard -110 vig) across a real sample — not a lucky week or two.
+Backfilled games (predicted after they were played, from today's
+ratings) are flagged `is_backfill` in `model_log` and excluded from
+grades, so they can't inflate those numbers with look-ahead bias.
 
 ## Roadmap (as you said: start simple, then get more sophisticated)
 
