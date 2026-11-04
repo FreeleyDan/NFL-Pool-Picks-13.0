@@ -85,6 +85,11 @@ def _run():
     )
 
     team_ratings, games_played = ratings.blended_team_ratings(played, played_prior, hfa)
+    data._record(
+        "SRS convergence", bool(getattr(ratings, "LAST_SRS_CONVERGED", True)),
+        f"Final SRS delta: {getattr(ratings, 'LAST_SRS_DELTA', 0.0):.5f} "
+        f"(tolerance {config.SRS_TOLERANCE}) -- {'converged' if getattr(ratings, 'LAST_SRS_CONVERGED', True) else 'DID NOT CONVERGE, ratings may be unstable'}",
+    )
     raw_diff = ratings.raw_point_differential(played_prior)
 
     # Turnover luck regression applies HERE, before the snapshot is saved
@@ -114,20 +119,30 @@ def _run():
     db.save_ratings_snapshot(config.SEASON, week, team_ratings, games_played, raw_diff)
 
     # Direct sign-mismatch check: a team that outscored opponents overall
-    # should not end up with a negative SRS rating, and vice versa. This
-    # is independent of whatever the SRS math is doing internally -- if it
-    # fires, it's strong, simple evidence of a real bug.
-    # Compares against the rating BEFORE the turnover luck adjustment, since
-    # that adjustment can legitimately flip a borderline team's sign on
-    # purpose -- this check should isolate real SRS bugs, not flag the
-    # turnover correction doing exactly what it's meant to do.
+    # should not end up with a negative SRS rating, and vice versa.
+    # FIXED 2026-11-04: this used to compare the CURRENT blended rating
+    # against LAST season's raw differential, so any team that flipped
+    # year-over-year false-flagged mid-season. Now it uses the current
+    # season's differential once a team has >=4 current games (the same
+    # full-confidence threshold as the rating model), and falls back to
+    # last season's differential only for teams with a thin current
+    # sample. Compares against the rating BEFORE the turnover luck
+    # adjustment, since that adjustment can legitimately flip a
+    # borderline team's sign on purpose.
     pre_turnover_rating = {t: r - turnover_luck_adj.get(t, 0.0) for t, r in team_ratings.items()}
+    raw_diff_current = ratings.raw_point_differential(played) if len(played) else {}
+    raw_diff_check = {}
+    for t in team_ratings:
+        if games_played.get(t, 0) >= config.MIN_GAMES_FOR_FULL_CONFIDENCE and t in raw_diff_current:
+            raw_diff_check[t] = raw_diff_current[t]
+        elif t in raw_diff:
+            raw_diff_check[t] = raw_diff[t]
     mismatched_teams = [
         t for t in team_ratings
-        if t in raw_diff and abs(raw_diff[t]) > 3 and (raw_diff[t] > 0) != (pre_turnover_rating[t] > 0)
+        if t in raw_diff_check and abs(raw_diff_check[t]) > 3 and (raw_diff_check[t] > 0) != (pre_turnover_rating[t] > 0)
     ]
     sign_mismatches = [
-        f"{t}: raw point diff {raw_diff[t]:+.1f} but SRS rating (pre-turnover-adj) {pre_turnover_rating[t]:+.1f}"
+        f"{t}: raw point diff {raw_diff_check[t]:+.1f} but SRS rating (pre-turnover-adj) {pre_turnover_rating[t]:+.1f}"
         for t in mismatched_teams
     ]
     data._record(
@@ -144,8 +159,13 @@ def _run():
     if team_ratings:
         ranked = sorted(team_ratings, key=team_ratings.get, reverse=True)
         teams_to_trace = list(dict.fromkeys(ranked[:2] + ranked[-2:] + mismatched_teams))
+        # FIXED 2026-11-04: trace the CURRENT season's games when the
+        # team has played this season -- tracing last season's games
+        # for a rating that is now mostly current-season was misleading.
+        trace_source = played if len(played) else played_prior
+        trace_label = "current-season" if len(played) else "prior-season"
         for t in teams_to_trace:
-            trace = ratings.debug_team_games(t, played_prior, hfa)
+            trace = ratings.debug_team_games(t, trace_source, hfa)
             lines_trace = [
                 f"wk{g['week']} vs {g['opponent']} ({g['home_or_away']}"
                 f"{', NEUTRAL SITE' if g['neutral_site'] else ''}): "
@@ -154,9 +174,9 @@ def _run():
                 for g in trace
             ]
             data._record(
-                f"Game trace: {t} (rating {team_ratings[t]:+.1f}, raw point diff {raw_diff.get(t, 'n/a')})",
+                f"Game trace ({trace_label}): {t} (rating {team_ratings[t]:+.1f}, raw point diff {raw_diff_check.get(t, raw_diff.get(t, 'n/a'))})",
                 True,
-                " || ".join(lines_trace) if lines_trace else "No prior-season games found for this team.",
+                " || ".join(lines_trace) if lines_trace else f"No {trace_label} games found for this team.",
             )
     log.info("Empirical HFA: %.2f pts", hfa)
     if team_ratings:
@@ -261,12 +281,12 @@ def _run():
         backfill_preds = model.predict_completed_games(
             missing, team_ratings, games_played, hfa, pts_for=pts_for, pts_against=pts_against
         )
-        db.save_model_log(config.SEASON, backfill_preds)
+        db.save_model_log(config.SEASON, backfill_preds, is_backfill=True)
         data._record(
             "Backfill completed games into model_log", True,
             f"Logged {len(backfill_preds)} already-completed game(s) that were missing a prediction "
             f"(likely from before the logging feature was added). These use TODAY's ratings rather than "
-            f"a true point-in-time prediction, so treat their grades as a rough approximation, not a "
+            f"a true point-in-time prediction, so they are flagged is_backfill and EXCLUDED from grading, not a "
             f"rigorous backtest. Games: " + ", ".join(
                 f"wk{p.week} {p.away}@{p.home}" for p in backfill_preds
             ),
@@ -346,15 +366,26 @@ def _run():
         lines.extend(crit)
 
     if not survivor_opt.empty:
-        next_pick = survivor_opt.iloc[0]
-        lines.append(f"\nSurvivor pick this week: {next_pick['recommended_team']} "
+        # FIXED 2026-11-04: iloc[0] was not necessarily this week's pick
+        # if the optimizer skipped a week -- find this week's row first.
+        this_week_rows = survivor_opt[survivor_opt["week"] == week]
+        next_pick = this_week_rows.iloc[0] if len(this_week_rows) else survivor_opt.iloc[0]
+        week_label = f"Week {int(next_pick['week'])}" if int(next_pick['week']) != week else "this week"
+        lines.append(f"\nSurvivor pick {week_label}: {next_pick['recommended_team']} "
                       f"(win prob {next_pick['win_prob']}) -- see dashboard for full season plan.")
 
     lines.append(f"\nHFA (empirical): {hfa:.2f} pts | EPA layer: {epa_result['note']} "
                  f"{'[LIVE]' if config.EPA_LIVE else '[SHADOW]'}")
     lines.append(f"Injury data: {inj_review['note']}")
 
-    send_email(f"NFL Pool Picks -- Week {week}", "\n".join(lines))
+    # Email is opt-in only (SMTP_HOST unset = skipped inside send_email).
+    # FIXED 2026-11-04: an SMTP failure used to abort the whole run
+    # after picks were already saved, so a workflow commit step after
+    # this would never run. Email must never block picks/DB.
+    try:
+        send_email(f"NFL Pool Picks -- Week {week}", "\n".join(lines))
+    except Exception as e:
+        log.warning("Email failed (picks already saved, continuing): %s", e)
     log.info("Done.")
 
 
