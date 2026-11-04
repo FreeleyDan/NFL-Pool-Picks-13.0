@@ -16,11 +16,21 @@ SOS-adjusted numbers instead of raw ones.
 """
 from __future__ import annotations
 
+import logging
 import math
 
 import pandas as pd
 
 from . import config
+
+log = logging.getLogger(__name__)
+
+# Last SRS solve diagnostics, for weekly_run to surface in Data Health.
+# SRS used to silently return after SRS_MAX_ITERS even if it never
+# converged -- now weekly_run records a failed convergence instead of
+# letting a non-converged rating pass as normal.
+LAST_SRS_CONVERGED: bool = True
+LAST_SRS_DELTA: float = 0.0
 
 
 def _adjusted_margin(home_score: float, away_score: float, hfa: float, is_neutral: bool = False) -> float:
@@ -108,6 +118,9 @@ def srs_ratings(games: pd.DataFrame, hfa: float) -> dict[str, float]:
         edges[home].append((away, m, w_home))
         edges[away].append((home, -m, w_away))
 
+    global LAST_SRS_CONVERGED, LAST_SRS_DELTA
+    LAST_SRS_CONVERGED = False
+    LAST_SRS_DELTA = float("inf")
     for _ in range(config.SRS_MAX_ITERS):
         new_ratings = {}
         for t in teams:
@@ -122,8 +135,14 @@ def srs_ratings(games: pd.DataFrame, hfa: float) -> dict[str, float]:
 
         delta = max(abs(new_ratings[t] - ratings[t]) for t in teams)
         ratings = new_ratings
+        LAST_SRS_DELTA = delta
         if delta < config.SRS_TOLERANCE:
+            LAST_SRS_CONVERGED = True
             break
+    if not LAST_SRS_CONVERGED:
+        log.warning("SRS did not converge after %s iterations (final delta %.4f) -- "
+                    "ratings may be unstable; check Data Health.",
+                    config.SRS_MAX_ITERS, LAST_SRS_DELTA)
 
     return ratings
 
