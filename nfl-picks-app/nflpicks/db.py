@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS picks (
     injury_flags TEXT, manual_adj_home REAL, manual_adj_away REAL,
     vegas_total REAL, model_total REAL, total_pick TEXT,
     run_time TEXT, needs_review INTEGER DEFAULT 0, model_independent REAL, weather_note TEXT,
-    pool_spread REAL, pool_total REAL,
+    pool_spread REAL, pool_total REAL, cover_prob REAL,
     PRIMARY KEY (season, week, home_team, away_team)
 );
 
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS model_log (
     vegas_close REAL, margin_model REAL, epa_model REAL, combo_model REAL,
     live_variant TEXT, actual_margin REAL,
     abs_err_margin REAL, abs_err_epa REAL, abs_err_combo REAL, ats_result TEXT,
+    is_backfill INTEGER DEFAULT 0,
     PRIMARY KEY (season, week, away_team, home_team)
 );
 
@@ -127,6 +128,11 @@ def init_db(db_path: str | None = None):
             conn.execute("ALTER TABLE picks ADD COLUMN pool_spread REAL")
         if "pool_total" not in cols:
             conn.execute("ALTER TABLE picks ADD COLUMN pool_total REAL")
+        if "cover_prob" not in cols:
+            conn.execute("ALTER TABLE picks ADD COLUMN cover_prob REAL")
+        mcols = {r["name"] for r in conn.execute("PRAGMA table_info(model_log)").fetchall()}
+        if mcols and "is_backfill" not in mcols:
+            conn.execute("ALTER TABLE model_log ADD COLUMN is_backfill INTEGER DEFAULT 0")
         rcols = {r["name"] for r in conn.execute("PRAGMA table_info(team_ratings_snapshot)").fetchall()}
         if rcols and "raw_point_diff_prior_season" not in rcols:
             conn.execute("ALTER TABLE team_ratings_snapshot ADD COLUMN raw_point_diff_prior_season REAL")
@@ -179,8 +185,8 @@ def save_picks(season: int, predictions, db_path: str | None = None):
                 "INSERT INTO picks (season, week, home_team, away_team, vegas_spread, model_spread, "
                 "edge, pick, confidence, strong_edge, epa_shadow, injury_flags, manual_adj_home, "
                 "manual_adj_away, vegas_total, model_total, total_pick, run_time, needs_review, "
-                "model_independent, weather_note, pool_spread, pool_total) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "model_independent, weather_note, pool_spread, pool_total, cover_prob) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(season, week, home_team, away_team) DO UPDATE SET "
                 "vegas_spread=excluded.vegas_spread, model_spread=excluded.model_spread, "
                 "edge=excluded.edge, pick=excluded.pick, confidence=excluded.confidence, "
@@ -190,11 +196,13 @@ def save_picks(season: int, predictions, db_path: str | None = None):
                 "model_total=excluded.model_total, total_pick=excluded.total_pick, "
                 "run_time=excluded.run_time, needs_review=excluded.needs_review, "
                 "model_independent=excluded.model_independent, weather_note=excluded.weather_note, "
-                "pool_spread=excluded.pool_spread, pool_total=excluded.pool_total",
+                "pool_spread=excluded.pool_spread, pool_total=excluded.pool_total, "
+                "cover_prob=excluded.cover_prob",
                 (season, p.week, p.home, p.away, p.vegas_spread, p.model_spread, p.edge, p.pick,
                  p.confidence, int(p.strong_edge), p.epa_shadow, p.injury_flags, p.manual_adj_home,
                  p.manual_adj_away, p.vegas_total, p.model_total, p.total_pick, now, int(p.needs_review),
-                 p.model_independent, p.weather_note, p.pool_spread, p.pool_total),
+                 p.model_independent, p.weather_note, p.pool_spread, p.pool_total,
+                 getattr(p, "cover_prob", None)),
             )
 
 
@@ -297,12 +305,16 @@ def get_model_log_keys(season: int, db_path: str | None = None) -> set[tuple[int
     return {(r["week"], r["away_team"], r["home_team"]) for r in rows}
 
 
-def save_model_log(season: int, predictions, db_path: str | None = None):
+def save_model_log(season: int, predictions, db_path: str | None = None, is_backfill: bool = False):
     """
     Logs each game's prediction (all three model variants, plus which one
     was live) so grading.grade_and_summarize() has something to grade
-    once real results come in. This was the missing link -- the table
-    and the grading code both existed, but nothing ever wrote to it.
+    once real results come in.
+
+    FIXED 2026-11-04: backfill rows (predictions made AFTER the game,
+    from today's ratings) are flagged is_backfill=1 and are excluded
+    from grading -- counting them inflated grades with look-ahead bias.
+    A backfill row also never overwrites a genuine pre-game prediction.
     """
     now = datetime.utcnow().isoformat()
     live_variant = "D-live" if config.EPA_LIVE and any(p.combo_model is not None for p in predictions) else "B-live"
@@ -310,15 +322,22 @@ def save_model_log(season: int, predictions, db_path: str | None = None):
         for p in predictions:
             if p.vegas_spread is None:
                 continue  # nothing to grade without a market line to compare against
+            if is_backfill:
+                existing = conn.execute(
+                    "SELECT is_backfill FROM model_log WHERE season=? AND week=? AND away_team=? AND home_team=?",
+                    (season, p.week, p.away, p.home)).fetchone()
+                if existing is not None and not existing["is_backfill"]:
+                    continue  # genuine pre-game prediction already there -- never overwrite it
             conn.execute(
                 "INSERT INTO model_log (run_time, season, week, away_team, home_team, vegas_close, "
-                "margin_model, epa_model, combo_model, live_variant) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "margin_model, epa_model, combo_model, live_variant, is_backfill) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(season, week, away_team, home_team) DO UPDATE SET "
                 "run_time=excluded.run_time, vegas_close=excluded.vegas_close, "
                 "margin_model=excluded.margin_model, epa_model=excluded.epa_model, "
-                "combo_model=excluded.combo_model, live_variant=excluded.live_variant",
+                "combo_model=excluded.combo_model, live_variant=excluded.live_variant, "
+                "is_backfill=excluded.is_backfill",
                 (now, season, p.week, p.away, p.home, p.vegas_spread,
-                 p.margin_model, p.epa_shadow, p.combo_model, live_variant),
+                 p.margin_model, p.epa_shadow, p.combo_model, live_variant, int(is_backfill)),
             )
 
 
