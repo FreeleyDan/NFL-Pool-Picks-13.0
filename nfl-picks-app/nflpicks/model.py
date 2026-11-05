@@ -124,6 +124,9 @@ def predict_game(
     weather_data: dict | None = None,
     pool_spread: float | None = None,
     pool_total: float | None = None,
+    totals_off: dict | None = None,    # SRS totals ratings (shadow unless TOTALS_SRS_LIVE)
+    totals_def: dict | None = None,
+    totals_league_avg: float | None = None,
 ) -> GamePrediction:
     manual_adj = manual_adj or {}
     injury_suggested = injury_suggested or {}
@@ -232,7 +235,16 @@ def predict_game(
     weather_note = ""
     if pts_for is not None and pts_against is not None:
         from . import scoring, weather as weather_mod
-        model_total = scoring.predict_total(home, away, pts_for, pts_against)
+        # Totals model selection is a single config flag, totals-only:
+        # TOTALS_SRS_LIVE=False (default, SRS lost out-of-sample -- see
+        # scoring.py) keeps the old blend live; True uses the SRS split
+        # ratings when they were supplied, falling back to the old blend
+        # if they were not (so a caller that never computed SRS ratings
+        # cannot crash the live run by flipping the flag).
+        if getattr(config, "TOTALS_SRS_LIVE", False) and totals_off is not None and totals_def is not None:
+            model_total = scoring.predict_total_srs(home, away, totals_off, totals_def, totals_league_avg)
+        else:
+            model_total = scoring.predict_total(home, away, pts_for, pts_against)
 
         if weather_data is not None and not weather_mod.is_indoor(row.get("roof")):
             flat_red, pct_red, reason = weather_mod.total_adjustment(weather_data)
@@ -275,6 +287,9 @@ def predict_completed_games(
     hfa: float,
     pts_for: dict | None = None,
     pts_against: dict | None = None,
+    totals_off: dict | None = None,
+    totals_def: dict | None = None,
+    totals_league_avg: float | None = None,
 ) -> list[GamePrediction]:
     """
     Predicts games that have ALREADY been played, using whatever ratings
@@ -294,7 +309,8 @@ def predict_completed_games(
     """
     preds = []
     for _, row in completed.iterrows():
-        p = predict_game(row, team_ratings, games_played, hfa, pts_for=pts_for, pts_against=pts_against)
+        p = predict_game(row, team_ratings, games_played, hfa, pts_for=pts_for, pts_against=pts_against,
+                         totals_off=totals_off, totals_def=totals_def, totals_league_avg=totals_league_avg)
         preds.append(p)
     return preds
 
@@ -311,6 +327,9 @@ def predict_week(
     pts_against: dict | None = None,
     fetch_weather: bool = True,
     pool_lines: dict | None = None,
+    totals_off: dict | None = None,
+    totals_def: dict | None = None,
+    totals_league_avg: float | None = None,
 ) -> list[GamePrediction]:
     injury_review = injury_review or {"suggested": {}, "flags": {}}
     epa = epa or {"ratings": None}
@@ -335,6 +354,7 @@ def predict_week(
             epa_live=config.EPA_LIVE,
             pts_for=pts_for, pts_against=pts_against,
             weather_data=weather_data,
+            totals_off=totals_off, totals_def=totals_def, totals_league_avg=totals_league_avg,
             pool_spread=override.get("pool_spread"),
             pool_total=override.get("pool_total"),
         )
