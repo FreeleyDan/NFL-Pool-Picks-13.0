@@ -627,6 +627,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--totals", action="store_true",
                         help="also run the totals harness (item 8): old blend vs SRS splits, "
                              "out-of-sample and in-sample, totals-only; does not affect spread variants")
+    parser.add_argument("--pool-lines-csv", default=None,
+                        help="past pool-slate CSV (batch-3 item 4, format in "
+                             "pool_lines.py): each variant's summary gains a "
+                             "pool_line_comparison re-grading its picks "
+                             "against the pool line vs the recorded line. "
+                             "With no file, or an empty file, the comparison "
+                             "reports the empty state instead of numbers.")
+    parser.add_argument("--decompose", action="store_true",
+                        help="also attach an error decomposition (batch-3 item 3) per variant: "
+                             "ATS%/MAE by spread bucket, fav/dog, side, season phase, team, "
+                             "total, weather, and division, with sample sizes and a "
+                             "small-sample flag. Context (total/div/wind) is joined from "
+                             "the same games frame; missing context lands in 'unknown' "
+                             "buckets and is reported as coverage, never imputed.")
     args = parser.parse_args(argv)
     if "-" in args.seasons:
         lo, hi = args.seasons.split("-", 1)
@@ -678,6 +692,26 @@ def main(argv: list[str] | None = None) -> int:
             baseline_games = summary["_games"]
         if baseline_games is not None and name != "baseline":
             summary["paired_vs_baseline"] = paired_comparison(baseline_games, summary["_games"])
+        if args.pool_lines_csv:
+            from . import pool_lines as _pl
+            _loaded = _pl.load_pool_lines_file(args.pool_lines_csv)
+            _rows = summary["_games"].to_dict("records")
+            if name == "calibrated_pick":
+                # evaluate_variant grades this variant on the SHRUNK
+                # pick; re-grading on the raw margin would compare a
+                # different pick, so attach the shrunk margin as the
+                # pick margin (pool_lines grades pick_margin when
+                # present, on both lines alike).
+                for _r in _rows:
+                    _r["pick_margin"] = calibration.shrunk_margin(_r["model_margin"])
+            summary["pool_line_comparison"] = _pl.grade_pool_lines(_rows, _loaded["rows"])
+            summary["pool_line_comparison"]["pool_csv_errors"] = _loaded["errors"]
+            summary["pool_line_comparison"]["pool_csv_note"] = _loaded["note"]
+        if args.decompose:
+            from . import error_decomposition as _ed
+            rows = _ed.normalize_backtest_rows(summary["_games"])
+            rows = _ed.attach_context(rows, games)
+            summary["error_decomposition"] = _ed.decompose(rows)
         results[name] = {k: v for k, v in summary.items() if k != "_games"}
     payload = {"seasons": seasons, "variants": results,
                "caveat": "spread_line is the recorded nflverse line, not a verified "
