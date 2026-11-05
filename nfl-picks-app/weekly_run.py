@@ -16,7 +16,7 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 
-from nflpicks import config, data, ratings, injuries, epa, model, survivor, db, scoring
+from nflpicks import config, data, ratings, injuries, epa, model, survivor, db, scoring, manual_adjustments, run_diff
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("weekly_run")
@@ -36,6 +36,104 @@ def send_email(subject: str, body: str):
         server.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
         server.send_message(msg)
     log.info("Email sent to %s", config.EMAIL)
+
+
+def _capture_previous_state(season: int, week: int, db_path: str | None = None) -> dict | None:
+    """Snapshot the previously SAVED run for this season/week, for
+    the what-changed diff (batch 3, item 6). MUST be called before
+    this run's first save (save_ratings_snapshot), because every
+    save overwrites the previous run's rows in place -- after the
+    first save there is nothing left to diff against. Returns None
+    (not an error) when no previous run exists for the week, or
+    when the read itself fails: a diff must never break the run.
+    Picks carry their run_time, so the diff can say which run it
+    is diffing against (Tuesday's run, or Thursday 7 AM's)."""
+    try:
+        with db.connect(db_path) as conn:
+            picks = conn.execute(
+                "SELECT * FROM picks WHERE season=? AND week=?", (season, week)).fetchall()
+            ratings_rows = conn.execute(
+                "SELECT * FROM team_ratings_snapshot WHERE season=? AND week=?",
+                (season, week)).fetchall()
+            try:
+                inj_rows = conn.execute(
+                    "SELECT * FROM injury_review WHERE season=? AND week=?",
+                    (season, week)).fetchall()
+            except Exception:
+                inj_rows = []
+            try:
+                line_rows = conn.execute(
+                    "SELECT * FROM line_snapshots WHERE season=? AND week=?",
+                    (season, week)).fetchall()
+            except Exception:
+                line_rows = []
+    except Exception as exc:
+        log.warning("Could not capture previous run state for diff (continuing without a diff): %s", exc)
+        return None
+    if not picks and not ratings_rows and not inj_rows and not line_rows:
+        return None
+    old_picks = {}
+    run_times = []
+    for p in picks:
+        old_picks[(p["home_team"], p["away_team"])] = {
+            "pick": p["pick"], "edge": p["edge"], "model_independent": p["model_independent"],
+            "vegas_spread": p["vegas_spread"], "pool_spread": p["pool_spread"],
+            "cover_prob": p["cover_prob"], "weather_note": p["weather_note"],
+            "total_pick": p["total_pick"], "model_total": p["model_total"],
+        }
+        if p["run_time"]:
+            run_times.append(p["run_time"])
+    return {
+        "old_run_time": max(run_times) if run_times else None,
+        "old_picks": old_picks,
+        "old_ratings": {r["team"]: r["rating"] for r in ratings_rows},
+        "old_injuries": [dict(r) for r in inj_rows],
+        "old_lines": {(r["home_team"], r["away_team"], r["source"]): r["line"] for r in line_rows},
+    }
+
+
+def _save_what_changed(season: int, week: int, previous: dict | None,
+                       predictions, team_ratings: dict, inj_detail: list):
+    """Build and persist the what-changed diff for this run, and
+    record it as a diagnostic so the Actions log and Data Health
+    show it even without opening the dashboard. New values come
+    from this run's in-memory results (predictions, ratings,
+    injury detail); old values come from _capture_previous_state.
+    Never raises: a diff failure must not fail a run whose picks
+    are already saved."""
+    try:
+        new_picks = {}
+        new_lines = {}
+        for p in predictions:
+            new_picks[(p.home, p.away)] = {
+                "pick": p.pick, "edge": p.edge, "model_independent": p.model_independent,
+                "vegas_spread": p.vegas_spread, "pool_spread": p.pool_spread,
+                "cover_prob": p.cover_prob, "weather_note": p.weather_note,
+                "total_pick": p.total_pick, "model_total": p.model_total,
+            }
+            if p.pool_spread is not None:
+                new_lines[(p.home, p.away, "pool")] = p.pool_spread
+            if p.vegas_spread is not None:
+                new_lines[(p.home, p.away, "closing")] = p.vegas_spread
+        if previous is None:
+            diff = run_diff.build_diff({}, {}, {}, {}, [], [], {}, {})
+            data._record("What changed since last run", True, diff["summary"])
+            log.info("What changed: %s", diff["summary"])
+            return
+        diff = run_diff.build_diff(
+            previous["old_picks"], new_picks,
+            previous["old_ratings"], team_ratings,
+            previous["old_injuries"], inj_detail,
+            previous["old_lines"], new_lines)
+        db.save_run_diff(season, week, diff["items"])
+        prev_label = f"previous run ({previous['old_run_time']})" if previous["old_run_time"] else "previous run"
+        data._record("What changed since last run", True,
+                     f"vs {prev_label}: {diff['summary']}")
+        log.info("What changed vs %s: %s", prev_label, diff["summary"])
+        for it in diff["items"][:20]:
+            log.info("  CHANGED [%s] %s: %s", it["category"], it["matchup"], it["detail"])
+    except Exception as exc:
+        log.warning("What-changed diff failed (picks already saved, continuing): %s", exc)
 
 
 def main():
@@ -60,6 +158,11 @@ def _run():
         return
     week = int(upcoming["week"].iloc[0])
     log.info("Predicting week %s (%s games)", week, len(upcoming))
+
+    # What-changed baseline (batch 3, item 6): capture BEFORE the
+    # first save below overwrites the previous run's rows. The
+    # diff itself is built and saved after predictions exist.
+    previous_state = _capture_previous_state(config.SEASON, week)
 
     hfa = ratings.compute_empirical_hfa(played, played_prior)
 
@@ -227,7 +330,26 @@ def _run():
 
     epa_result = epa.weighted_epa_ratings(team_stats)  # team_stats already fetched above
 
-    manual_adj = db.get_manual_adjustments()
+    # Manual adjustments (batch 3, item 5): the versioned repo file
+    # is the source of truth, merged over the database per team (file
+    # wins where both have a team; database-only teams still apply
+    # until exported, so nothing is silently dropped). Ratings
+    # semantics are unchanged -- manual_adj still feeds into
+    # predict_week exactly as before. A corrupt file is recorded as
+    # a failed diagnostic and falls back to the database for this
+    # run, rather than silently running with no adjustments.
+    try:
+        _adj = manual_adjustments.load_weekly_adjustments()
+        manual_adj = _adj["adjustments"]
+        _adj_reasons = _adj["reasons"]
+        data._record("Manual adjustments source", True, _adj["source_note"])
+    except ValueError as exc:
+        manual_adj = db.get_manual_adjustments()
+        _adj_reasons = {}
+        data._record("Manual adjustments source", False,
+                     f"Repo file unreadable ({exc}) -- fell back to the database "
+                     f"({len(manual_adj)} team(s)) for this run. Fix the file; "
+                     "do not assume the file's adjustments applied.")
 
     # Returning starters: the positive mirror of the injury review. Looks
     # at the last few weeks of saved injury history for starters who were
@@ -252,7 +374,10 @@ def _run():
         f"{len(pool_lines)} game(s) this week use a pool line instead of the live Vegas line."
         if pool_lines else "No pool line overrides set -- all picks use the live Vegas line.",
     )
-    reasons = {}  # dashboard-set adjustments don't carry a per-run reason; decision_log dedupes on value anyway
+    # File adjustments carry their reason; database-only ones keep
+    # the old behaviour (no per-run reason; decision_log dedupes on
+    # value anyway).
+    reasons = {t: _adj_reasons.get(t, "") for t in manual_adj}
     db.log_decisions(config.SEASON, week, manual_adj, reasons)
 
     pts_for, pts_against = scoring.blended_scoring_averages(played, played_prior)
@@ -278,6 +403,13 @@ def _run():
         if p.vegas_spread is not None:
             db.save_line_snapshot(config.SEASON, week, p.home, p.away, "closing", p.vegas_spread)
     db.save_injury_review(config.SEASON, week, inj_review["detail"])
+    # What-changed diff vs the previous saved run for this week
+    # (Tuesday's run, or Thursday 7 AM's when this is the 10 AM
+    # final run). Computed from in-memory new values vs the
+    # pre-save snapshot above -- the picks table no longer holds
+    # the old slate once save_picks ran, so this ordering matters.
+    _save_what_changed(config.SEASON, week, previous_state,
+                       predictions, team_ratings, inj_review["detail"])
     db.save_model_log(config.SEASON, predictions)
 
     # ---- Backfill: log any already-completed games this season that

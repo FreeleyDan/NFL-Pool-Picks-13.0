@@ -40,9 +40,11 @@ def new_state(teams) -> dict[str, float]:
     return {str(t): float(config.ELO_START) for t in teams}
 
 
-def expected_home_win_prob(elo_home: float, elo_away: float) -> float:
+def expected_home_win_prob(elo_home: float, elo_away: float, hfa_points: float | None = None) -> float:
     """Logistic expected home win prob, with home field in Elo points."""
-    diff = (elo_home + float(config.ELO_HFA_POINTS)) - elo_away
+    if hfa_points is None:
+        hfa_points = float(config.ELO_HFA_POINTS)
+    diff = (elo_home + float(hfa_points)) - elo_away
     return 1.0 / (1.0 + 10.0 ** (-diff / 400.0))
 
 
@@ -62,26 +64,55 @@ def elo_margin(elo_home: float, elo_away: float, hfa: float) -> float:
     return sd * _NORM.inv_cdf(p) + float(hfa)
 
 
-def regress_state(state: dict[str, float]) -> dict[str, float]:
+def regress_state(state: dict[str, float], fraction: float | None = None) -> dict[str, float]:
     """Season rollover: pull every rating partway back to ELO_START."""
-    f = float(config.ELO_PRIOR_REGRESSION)
+    f = float(config.ELO_PRIOR_REGRESSION) if fraction is None else float(fraction)
     start = float(config.ELO_START)
     return {t: start + (r - start) * f for t, r in state.items()}
 
 
-def apply_week(state: dict[str, float], week_games: pd.DataFrame) -> dict[str, float]:
+def _margin_multiplier(margin: float, mode: str | None) -> float:
+    """Multiplier on the Elo update for a game decided by `margin` points
+    (home perspective, absolute value used). None = win/loss only (the
+    live/batch-2 rule). "log" = 1 + 0.3*log2(1+|margin|), capped at 2.0
+    (a 1-pt win counts 1.3x, a 7-pt win 1.9x, 14+ pts 2.0x).
+    "capped" = 1 + min(|margin|, 14)/28, i.e. 1.0x to 1.5x, linear.
+    Both are bounded so a single blowout cannot swing a rating the way
+    an uncapped margin multiplier would; SRS already carries blowout
+    information, which is why the default stays win/loss only."""
+    if mode is None:
+        return 1.0
+    m = abs(float(margin))
+    if mode == "log":
+        return min(2.0, 1.0 + 0.3 * math.log2(1.0 + m))
+    if mode == "capped":
+        return 1.0 + min(m, 14.0) / 28.0
+    raise ValueError(f"unknown margin_mode: {mode!r}")
+
+
+def apply_week(state: dict[str, float], week_games: pd.DataFrame, k: float | None = None,
+               margin_mode: str | None = None, hfa_points: float | None = None,
+               k_multiplier: float | None = None) -> dict[str, float]:
     """Apply one week's results to `state`, returning a NEW dict.
 
     All updates use pre-week ratings (snapshot first, then update), so
     games within the same week never see each other. Rows need
     home_team, away_team, home_score, away_score; rows without scores
     are skipped. Teams not yet in state start at ELO_START.
+    Optional overrides exist ONLY for the batch-3 variant harness
+    (elo_variants.py): k, margin_mode and hfa_points default to the
+    config values, and k_multiplier (1.0 = no change) lets a caller
+    scale K by week -- e.g. a recency variant that counts late-season
+    games more than early ones. Live behaviour is unchanged when all
+    overrides are left at their defaults.
     """
     if week_games is None or len(week_games) == 0:
         return dict(state)
     pre = dict(state)
     out = dict(state)
-    k = float(config.ELO_K)
+    k = float(config.ELO_K) if k is None else float(k)
+    if k_multiplier is not None:
+        k = k * float(k_multiplier)
     for _, row in week_games.iterrows():
         try:
             hs, aws = float(row["home_score"]), float(row["away_score"])
@@ -92,9 +123,9 @@ def apply_week(state: dict[str, float], week_games: pd.DataFrame) -> dict[str, f
         home, away = str(row["home_team"]), str(row["away_team"])
         eh = pre.get(home, float(config.ELO_START))
         ea = pre.get(away, float(config.ELO_START))
-        exp_home = expected_home_win_prob(eh, ea)
+        exp_home = expected_home_win_prob(eh, ea, hfa_points=hfa_points)
         actual_home = 1.0 if hs > aws else 0.0 if hs < aws else 0.5
-        delta = k * (actual_home - exp_home)
+        delta = k * (actual_home - exp_home) * _margin_multiplier(hs - aws, margin_mode)
         # Accumulate onto `out` (not `pre`): a team cannot play twice
         # in a real NFL week, but overwriting here would silently drop
         # the first game's update if it ever did.
