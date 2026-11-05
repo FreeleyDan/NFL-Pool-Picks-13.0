@@ -7,6 +7,8 @@
 # grades the games that just finished and gives an early look.
 #
 # What it does:
+#   0. Unit tests FIRST -- a bad push fails fast here, before any pick
+#      is computed, graded, or committed (item 7a, 2026-11-04).
 #   1. weekly_run.py -- pulls data, computes ratings, saves picks to SQLite
 #   2. python -m nflpicks.grading -- grades completed games (backfill rows
 #      are excluded from grades; see grading.py)
@@ -39,6 +41,11 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      # Tests run BEFORE the weekly run on purpose: a failing test
+      # fails the job here (no `|| true`), so a broken push never
+      # computes, grades, or commits picks.
+      - name: Run unit tests (fail fast)
+        run: python -m unittest discover -s tests -v
       # Season defaults to config.SEASON (2026). To run a different
       # season, edit config.py -- do NOT set PICKS_SEASON to an empty
       # value here, or config.py's int() will crash on "".
