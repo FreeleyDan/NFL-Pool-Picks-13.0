@@ -1,0 +1,31 @@
+name: Tests
+
+# Runs on every push and pull request so a broken change is caught
+# here, not on the scheduled weekly run (weekly.yml also runs the
+# tests first, but only on its Tue/Thu schedule -- a bad push on
+# Monday would otherwise sit uncaught until Tuesday's run, or
+# worse, fail the Thursday run that matters for the pool deadline).
+# All tests are offline (no network calls, no secrets).
+#
+# NOTE FOR THE PUSHER: workflow files cannot be pushed through the
+# GitHub contents API (it returns 403 on .github/workflows/*), so
+# this file was built locally and must be added via the GitHub
+# website (or a git push from a local checkout), like weekly.yml
+# and the Stock Terminal tests workflow before it.
+on: [push, pull_request]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r nfl-picks-app/requirements.txt
+      - name: Compile all modules
+        run: python3 -m py_compile nfl-picks-app/nflpicks/*.py nfl-picks-app/*.py
+      - name: Run offline tests
+        working-directory: nfl-picks-app
+        run: python3 -m unittest discover -s tests -v
