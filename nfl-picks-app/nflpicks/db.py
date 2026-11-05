@@ -135,6 +135,19 @@ CREATE TABLE IF NOT EXISTS adjustment_grades (
     losses INTEGER, pushes INTEGER, ats_pct REAL, run_time TEXT,
     PRIMARY KEY (season, scope)
 );
+
+-- What-changed diff (batch 3, item 6, added 2026-11-04): one row per
+-- reported change from one run, keyed by run_time so a later run
+-- never overwrites an earlier run's diff. The picks table itself is
+-- overwritten every run, so the diff is the only surviving record
+-- of what the previous run's slate looked like. Append-only by
+-- construction: save_run_diff inserts under its own run_time.
+CREATE TABLE IF NOT EXISTS run_diffs (
+    season INTEGER, week INTEGER, run_time TEXT, matchup TEXT,
+    home_team TEXT, away_team TEXT, category TEXT, detail TEXT,
+    magnitude REAL,
+    PRIMARY KEY (season, week, run_time, matchup, category)
+);
 """
 
 
@@ -504,6 +517,58 @@ def save_diagnostics(steps: list[dict], db_path: str | None = None):
 def get_diagnostics(db_path: str | None = None):
     with connect(db_path) as conn:
         return conn.execute("SELECT * FROM run_diagnostics ORDER BY rowid").fetchall()
+
+
+def save_run_diff(season: int, week: int, items: list[dict], run_time: str | None = None,
+                  db_path: str | None = None) -> str:
+    """Persist one run's what-changed items (run_diff.build_diff
+    output). run_time defaults to now (naive UTC ISO, matching
+    picks.run_time). Rows are keyed by run_time, so saving a new
+    run's diff never touches a previous run's rows. An empty items
+    list still records nothing -- callers that want an explicit
+    "no changes" record should check get_latest_run_diff's empty
+    return instead of inventing rows."""
+    run_time = run_time or datetime.utcnow().isoformat()
+    with connect(db_path) as conn:
+        for it in items:
+            conn.execute(
+                "INSERT INTO run_diffs (season, week, run_time, matchup, home_team, away_team, "
+                "category, detail, magnitude) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(season, week, run_time, matchup, category) DO UPDATE SET "
+                "home_team=excluded.home_team, away_team=excluded.away_team, "
+                "detail=excluded.detail, magnitude=excluded.magnitude",
+                (season, week, run_time, it["matchup"], it.get("home"), it.get("away"),
+                 it["category"], it["detail"], it.get("magnitude", 0.0)),
+            )
+    return run_time
+
+
+def get_latest_run_diff(season: int, week: int, db_path: str | None = None) -> dict:
+    """Latest saved run_diffs rows for one season/week, in
+    run_diff category order (flips first). Empty state (no rows)
+    returns items=[] and run_time=None -- never an invented diff.
+    Sorting needs run_diff.CATEGORY_RANK; to keep db.py free of
+    that import cycle risk (run_diff imports config only, so the
+    import is actually safe), the rank map is duplicated here in
+    miniature via a local import."""
+    from . import run_diff as _run_diff
+    with connect(db_path) as conn:
+        try:
+            rows = conn.execute(
+                "SELECT MAX(run_time) AS latest FROM run_diffs WHERE season=? AND week=?",
+                (season, week)).fetchall()
+        except Exception:
+            return {"run_time": None, "items": []}
+        latest = rows[0]["latest"] if rows else None
+        if not latest:
+            return {"run_time": None, "items": []}
+        data = conn.execute(
+            "SELECT * FROM run_diffs WHERE season=? AND week=? AND run_time=?",
+            (season, week, latest)).fetchall()
+    items = [dict(r) for r in data]
+    items.sort(key=lambda i: (_run_diff.CATEGORY_RANK.get(i["category"], 99),
+                              -(i["magnitude"] or 0.0), i["matchup"]))
+    return {"run_time": latest, "items": items}
 
 
 def save_ratings_snapshot(season: int, week: int, team_ratings: dict, games_played: dict,
