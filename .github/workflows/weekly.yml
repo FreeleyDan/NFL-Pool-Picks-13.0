@@ -1,10 +1,56 @@
 # Weekly NFL pool picks run -- NO EMAIL (per user, 2026-11-04).
 #
 # Runs Tuesday and Thursday at 15:00 UTC (7:00 AM PT in winter, 8:00 AM PT
-# in summer). Thursday's run is the one that matters for Barbara's pool:
-# picks are due Thursday at 11:00 AM PT, so Thursday morning catches the
-# latest lines and practice reports before the deadline. Tuesday's run
-# grades the games that just finished and gives an early look.
+# in summer), PLUS a Thursday final run at 18:00 UTC (batch 3, item 6,
+# 2026-11-04). Thursday's runs are the ones that matter for Barbara's
+# pool: picks are due Thursday at 11:00 AM PT, so Thursday morning
+# catches the latest lines and practice reports before the deadline.
+# Tuesday's run grades the games that just finished and gives an
+# early look.
+#
+# DST WARNING -- read before assuming the final run lands at 10 AM PT:
+# GitHub cron is fixed UTC; it does not follow daylight saving. PT is
+# UTC-8 in winter (PST) and UTC-7 in summer (PDT), so:
+#   * PST (Nov-Mar, most of the season incl. the playoff push):
+#     18:00 UTC = 10:00 AM PT -- one hour before the 11 AM deadline,
+#     exactly as intended.
+#   * PDT (Mar-Nov, incl. September-October early season):
+#     18:00 UTC = 11:00 AM PT -- AT the deadline, not before it.
+#     The final run still refreshes data, but a slate landing at
+#     deadline time cannot be reviewed before submitting. In PDT
+#     months, treat the 15:00 UTC run (8:00 AM PT) as the review
+#     slate, and use the dashboard's Refresh Picks Now button for
+#     a manual pre-deadline refresh instead of waiting for 18:00 UTC.
+#   The 15:00 UTC runs have the same fixed-UTC property (7 AM PST /
+#   8 AM PDT); only the final run's PDT landing is a problem,
+#   because it coincides with the deadline. GitHub scheduled runs
+#   can also start late, so every run time here is approximate.
+#   A timezone-aware schedule (one cron per DST period, or a
+#   dispatch-time check) was NOT added: it would need either two
+#   season-dependent crons that both fire year-round or a wrapper
+#   script, and the brief for this item specified the winter
+#   offset (10 AM PT = 18:00 UTC). If the PDT landing becomes a
+#   real problem in September, the honest fix is a second cron at
+#   17:00 UTC (10 AM PDT / 9 AM PST) -- NOT moving 18:00 UTC, which
+#   would break the winter 10 AM landing.
+#
+# Why the second Thursday run cannot corrupt the first (item 6):
+# the final run REUSES this same job end to end -- tests first, no
+# email, same commit step -- it is not a diff-only run. That is
+# safe because every save in weekly_run is an upsert keyed by
+# (season, week, matchup): the 10 AM run overwrites the 7 AM
+# slate in place, exactly as the 7 AM run overwrote Tuesday's.
+# The what-changed diff survives the overwrite because weekly_run
+# captures the old slate in memory BEFORE its first save and
+# persists only the diff, under its own run_time, in the
+# append-only run_diffs table (see nflpicks/run_diff.py) -- the
+# 10 AM diff is diffed against the 7 AM slate, and the 7 AM diff
+# is not touched by the 10 AM run. The concurrency group below
+# serializes overlapping runs (a delayed 7 AM run must finish
+# before the 10 AM run starts), so two runners can never commit
+# over each other from different checkouts; cancel-in-progress
+# is false on purpose, so a queued run waits instead of killing
+# a run mid-commit.
 #
 # What it does:
 #   0. Unit tests FIRST -- a bad push fails fast here, before any pick
@@ -23,7 +69,14 @@ name: Weekly NFL picks
 on:
   schedule:
     - cron: "0 15 * * 2,4"
+    - cron: "0 18 * * 4"
   workflow_dispatch:
+
+# Serialize runs: a delayed 7 AM run must finish before the 10 AM
+# final run starts, so two runners never push competing DB commits.
+concurrency:
+  group: weekly-picks
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -46,6 +99,17 @@ jobs:
       # computes, grades, or commits picks.
       - name: Run unit tests (fail fast)
         run: python -m unittest discover -s tests -v
+      # Freshness check (batch-3 item 10, 2026-11-04): report the
+      # PREVIOUS run's status (data as-of date, missed scheduled run,
+      # failed steps) before this run overwrites it, so a stale or
+      # failed previous run is visible in the job log. This step is
+      # report-only (--no-fail): a stale previous run is exactly
+      # what this run is about to fix, and blocking on it would leave
+      # the slate stale. Cron, permissions, and no-email behaviour
+      # are unchanged. The check reads the database only -- it does
+      # not (and cannot, without a token) read live Actions status.
+      - name: Check previous run freshness (never blocks)
+        run: python -m nflpicks.freshness --no-fail
       # Season defaults to config.SEASON (2026). To run a different
       # season, edit config.py -- do NOT set PICKS_SEASON to an empty
       # value here, or config.py's int() will crash on "".
