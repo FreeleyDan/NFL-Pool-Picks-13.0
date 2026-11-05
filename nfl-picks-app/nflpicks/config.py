@@ -345,6 +345,42 @@ SIM_CHEAP_COST_MAX_WINS = 0.10
 SIM_EXPENSIVE_COST_MIN_WINS = 0.25
 SIM_EXPENSIVE_P_FIRST_DROP_PP = 1.0
 
+# ---- Batch 3 (2026-11-04, items 1-2, second batch): pool-line staleness / Elo variants ----
+# STALENESS_LIVE stays False: no staleness score is wired into any pick.
+# The 2019-2025 backtest cannot run the true pool-vs-closing test at all
+# (games.csv carries ONE undated near-close line per game -- no pool
+# line, no opener, no line timestamps; no free multi-season open/close
+# archive was found, only paid/academic ones), and the closest honest
+# proxy (moneyline-implied margin as a second market reading) shows no
+# edge (see README batch-3 section). staleness.py is therefore a
+# grading/descriptive framework for future live snapshot pairs
+# (db.line_snapshots pool + closing), NOT a pick input. The existing
+# line-move FLAG (db.get_line_moves, review_queue) is untouched and
+# remains the only live staleness signal; staleness.py deliberately
+# does not reimplement flagging. The pool line is never auto-switched.
+STALENESS_LIVE = False
+STALENESS_BUCKETS = (1.0, 2.0, 3.0)  # bucket edges in points: <1, 1-2, 2-3, 3+
+STALENESS_MIN_MOVE = 1.0  # mirrors REVIEW_LINE_MOVE_THRESHOLD; a smaller move is noise for grading
+STALENESS_BOOTSTRAP_TRIALS = 2000
+STALENESS_BOOTSTRAP_SEED = 20261104
+# Elo variants (batch 3, item 2). One-at-a-time grid only -- a full
+# factorial over K x rollover x HFA x margin would be ~100 variants and
+# would guarantee a spurious "winner". The 11 non-baseline variants in
+# elo_variants.DEFAULT_VARIANTS are the whole grid; any variant promoted
+# would have to (a) win on the 2019-2022 training split, (b) also win
+# on the 2023-2025 test split, and (c) survive Bonferroni correction
+# across all 11 -- none did (see README). ELO_* live values are unchanged.
+ELO_VARIANT_KS = (10.0, 32.0, 40.0)
+ELO_VARIANT_ROLLOVERS = (0.25, 0.75, 1.0)
+ELO_VARIANT_HFA_POINTS = (0.0, 110.0)
+ELO_VARIANT_MARGIN_MODES = ("log", "capped")
+ELO_VARIANT_RECENCY_EARLY_MULT = 0.75  # weeks < 10: K scaled by this
+ELO_VARIANT_RECENCY_LATE_MULT = 1.25   # weeks >= 10: K scaled by this
+ELO_BOOTSTRAP_TRIALS = 2000
+ELO_BOOTSTRAP_SEED = 20261104
+ELO_TRAIN_SEASONS = (2019, 2020, 2021, 2022)
+ELO_TEST_SEASONS = (2023, 2024, 2025)
+
 # ---- Totals model: SRS-style scoring splits (2026-11-04, item 8) ----
 # TOTALS_SRS_LIVE stays False: the SRS totals model (scoring.py) was
 # built and graded point-in-time 2019-2025, and it does NOT beat the old
@@ -370,6 +406,72 @@ TOTALS_SRS_TOLERANCE = 1e-4
 # db.get_line_moves and review_queue.py share one threshold instead
 # of each hardcoding 1.0. The pool line is still never auto-switched.
 REVIEW_LINE_MOVE_THRESHOLD = 1.0
+
+# ---- Batch 3 (2026-11-04, items 3, 9, 10): error decomposition / pool results / freshness ----
+# Item 3: error_decomposition.py slices point-in-time backtest rows (or
+# graded live picks) and reports ATS% + MAE per slice, always with its
+# sample size. ERROR_MIN_DECIDED is the "do not act on this" floor: a
+# slice with fewer decided games is flagged small_sample, and the
+# worst-slice ranking only considers slices at/above it -- a 2-0 slice
+# is not a finding, it is noise. No slice changes a pick.
+ERROR_MIN_DECIDED = 30
+# Spread-bucket edges on |line| (nflverse, points): pick'em, short,
+# medium, large. Total-bucket edges on total_line (points).
+ERROR_SPREAD_EDGES = (0.5, 3.5, 7.5)
+ERROR_TOTAL_EDGES = (40.0, 45.0, 50.0)
+# Item 9: pool_results.py grades the picks actually submitted to
+# Barbara's pool against the model picks. Grading only -- it never
+# changes a pick, a line, or a model grade, and it invents no results:
+# with no imported rows it reports an empty state, not a 0-0 record.
+# Item 10: freshness.py warns when the dashboard would otherwise
+# present an old slate as current. The workflow runs Tue/Thu 15:00 UTC
+# (weekly.yml cron "0 15 * * 2,4"); a run is STALE when its picks are
+# a week old, WARN when older than 4 days or when the last scheduled
+# run was missed, and OK otherwise. MISSED means: now is past a
+# scheduled run time (plus a grace window for the run itself) but the
+# latest saved run predates that scheduled run. The app cannot read
+# live GitHub Actions status without a token it does not have, so the
+# live source remains the Actions tab -- freshness.py says so, and
+# never invents a live status.
+FRESHNESS_STALE_HOURS = 168.0  # 7 days: a week-old slate is never presented as today's
+FRESHNESS_WARN_HOURS = 96.0  # 4 days: older than any normal Tue->Thu->Tue gap
+FRESHNESS_RUN_GRACE_HOURS = 3.0  # a scheduled run gets this long to land before it counts as missed
+FRESHNESS_SCHEDULE_WEEKDAYS = (1, 3)  # Tue, Thu (Python weekday(): Mon=0)
+FRESHNESS_SCHEDULE_HOUR_UTC = 15
+
+# ---- Batch 3 (2026-11-04, items 4-5): pool-line slates / manual-adjustment file ----
+# Item 4: past pool slates for the backtest harness. A CSV in the
+# format documented in pool_lines.py (sportsbook convention by
+# default, converted to nflverse on parse). Empty = no slate
+# supplied, and pool_lines.py reports that empty state plainly --
+# it never invents lines. Set via env so a local harness run can
+# point at a slate without editing code.
+POOL_LINES_CSV_PATH = os.environ.get("POOL_LINES_CSV", "")
+# Item 5: the versioned repo file that is the manual-adjustments
+# source of truth (manual_adjustments.py). Empty = the default
+# repo file nfl-picks-app/manual_adjustments.json; the env var is
+# for tests and for runs pointed at a different checkout.
+MANUAL_ADJUSTMENTS_FILE = os.environ.get("PICKS_ADJUSTMENTS_FILE", "")
+MANUAL_ADJUSTMENTS_SCHEMA_VERSION = 1
+
+# ---- Batch 3 (2026-11-04, items 6-7): Thursday final-run diff / rating uncertainty ----
+# Item 7: uncertainty.py bands. UNCERTAINTY_PICK_USE stays False and
+# no code path changes a pick from a band: labels/bands only until a
+# walk-forward test justifies a pick-logic use. PRIOR_SD is a judgment
+# parameter (see uncertainty.py); GAME_MARGIN_SD is the 2019-2025
+# point-in-time backtest residual SD from calibration.py.
+UNCERTAINTY_PRIOR_SD = 5.0
+UNCERTAINTY_GAME_MARGIN_SD = 13.43
+UNCERTAINTY_Z90 = 1.645  # 90% band multiplier for rating_interval()
+UNCERTAINTY_PICK_USE = False
+# Item 6: run_diff.py reporting thresholds (points). A pick flip is
+# always reported regardless of edge size; everything else must move
+# at least this far to earn a row, so rounding wobbles do not flood
+# the Thursday review.
+RUN_DIFF_MIN_EDGE_MOVE = 0.5
+RUN_DIFF_MIN_RATING_MOVE = 0.5
+RUN_DIFF_MIN_LINE_MOVE = 0.5
+RUN_DIFF_MIN_TOTAL_MOVE = 0.5
 
 # ---- Survivor pool ----
 # NFL win probability from a point spread, via a logistic curve fit to
@@ -407,3 +509,36 @@ def to_nflverse_spread(sportsbook_spread: float) -> float:
 def to_sportsbook_spread(nflverse_spread: float) -> float:
     """nflverse line (positive = home favored) -> sportsbook line."""
     return -float(nflverse_spread)
+
+
+# ---- Batch 3 (2026-11-04, item 8): true play-by-play features ----
+# PBP_FEATURES_LIVE stays False: the features in pbp_features.py
+# (early-down success, red-zone efficiency) are graded
+# out-of-sample 2019-2025 in the harness and do NOT beat the
+# baseline there (see README), so nothing in model.py,
+# weekly_run.py, or dashboard.py reads them. The URL template
+# below is CONFIRMED, not guessed: the GitHub REST API listing
+# for the nflverse-data `pbp` release (id 58152862, updated
+# 2026-11-04) lists play_by_play_{season}.csv/.csv.gz/.parquet/
+# .qs/.rds per season, and the 2024 csv.gz fetched during this
+# build returned HTTP 200 at exactly the listed 19,362,351 bytes.
+# Batch 2's guesses 404'd because they used the wrong release
+# tag; the tag is `pbp`, the filename stem is `play_by_play_`.
+# csv.gz is the default because it is the smallest
+# pandas-readable form listed for every season.
+PBP_FEATURES_LIVE = False
+PBP_URL_TMPL = "https://github.com/nflverse/nflverse-data/releases/download/pbp/play_by_play_{season}.csv.gz"
+# Coefficient caps (points per unit rate differential, 0-1 scale)
+# for pbp_features.fit_pbp_coeff -- same clipping role as
+# FEATURE_COEFF_CAPS for the team-stats proxies. A cap of 100
+# cannot bind on any plausible fit (a 0.05 rate differential
+# moving a margin by 5 pts is already a coefficient of 100),
+# but it stops a tiny-denominator fit from producing an absurd
+# points-per-unit value.
+PBP_COEFF_CAPS = {"early_down": 100.0, "red_zone": 100.0}
+# Early-down success thresholds (Football Outsiders 40/60 rule;
+# see pbp_features.py -- a convention, not an nflverse column).
+PBP_EARLY_DOWN_THRESHOLDS = {1: 0.4, 2: 0.6}
+# Red zone = plays starting at yardline_100 <= 20.
+PBP_RED_ZONE_YARDLINE = 20.0
+
