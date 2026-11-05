@@ -256,11 +256,17 @@ def _run():
     db.log_decisions(config.SEASON, week, manual_adj, reasons)
 
     pts_for, pts_against = scoring.blended_scoring_averages(played, played_prior)
+    # SRS totals ratings (item 8, SHADOW): computed every run so flipping
+    # config.TOTALS_SRS_LIVE is a one-line change, but the old blend
+    # stays live until the SRS model wins walk-forward (it has not --
+    # see README item 8). Totals-only; spread picks never read these.
+    totals_off, totals_def, totals_league_avg = scoring.blended_srs_scoring(played, played_prior, hfa)
 
     predictions = model.predict_week(
         upcoming, team_ratings, games_played, hfa,
         manual_adj=manual_adj, injury_review=inj_review, epa=epa_result,
         pts_for=pts_for, pts_against=pts_against, pool_lines=pool_lines,
+        totals_off=totals_off, totals_def=totals_def, totals_league_avg=totals_league_avg,
     )
     db.save_picks(config.SEASON, predictions)
     # Line snapshots (item 7): pool line when set, closing/live line
@@ -287,7 +293,8 @@ def _run():
     ] if len(already_played_this_season) else already_played_this_season
     if len(missing):
         backfill_preds = model.predict_completed_games(
-            missing, team_ratings, games_played, hfa, pts_for=pts_for, pts_against=pts_against
+            missing, team_ratings, games_played, hfa, pts_for=pts_for, pts_against=pts_against,
+            totals_off=totals_off, totals_def=totals_def, totals_league_avg=totals_league_avg,
         )
         db.save_model_log(config.SEASON, backfill_preds, is_backfill=True)
         data._record(
