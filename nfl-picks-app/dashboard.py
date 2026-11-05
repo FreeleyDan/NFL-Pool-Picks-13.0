@@ -2,12 +2,13 @@
 Run locally with:  streamlit run dashboard.py
 Deploy free at:     https://share.streamlit.io  (point it at this repo)
 """
+import json
 import traceback
 
 import pandas as pd
 import streamlit as st
 
-from nflpicks import adjustment_grading, config, db, grading, review_queue, standings, submission
+from nflpicks import adjustment_grading, config, db, error_decomposition, freshness, grading, manual_adjustments, pool_results, review_queue, run_diff, standings, submission, uncertainty
 import weekly_run
 
 st.set_page_config(page_title="NFL Pool Picks", layout="wide")
@@ -67,6 +68,26 @@ with db.connect() as conn:
         "SELECT * FROM pool_line_overrides WHERE season=?", conn, params=(config.SEASON,)
     )
 
+# ---- Freshness banner (batch-3 item 10) ----
+# Shown on every load, before any slate is presented as current: if
+# the saved picks are stale, missed a scheduled run, or the last run
+# reported failures, say so HERE, not buried in a tab. This is the
+# last run saved in this database, NOT live GitHub Actions status
+# (the app has no Actions token) -- the banner says so.
+try:
+    _fresh = freshness.freshness_status(config.SEASON)
+except Exception:
+    _fresh = {"level": "stale", "message": "Could not check data freshness -- treat this slate as unverified.",
+              "failed_steps": [], "latest_run": None}
+if _fresh["level"] == "stale":
+    st.error("⚠️ STALE PICKS -- " + _fresh["message"] +
+             " Do not submit from this slate until you refresh it.")
+elif _fresh["level"] == "warn":
+    st.warning("⚠️ " + _fresh["message"])
+    if _fresh.get("failed_steps"):
+        st.warning("Failed step(s) on the last run: " + "; ".join(
+            f"{s['step']}: {s['detail']}" for s in _fresh["failed_steps"]))
+
 tab_names = ["ATS Picks", "Submit & Review", "Survivor Pool", "Injury Review", "Model Grades", "Manual Adjustments", "Data Health"]
 if picks_df.empty:
     st.info("No picks yet -- click \"🔄 Refresh Picks Now\" above to pull data and generate this week's picks. "
@@ -89,6 +110,13 @@ tab_ats, tab_submit, tab_survivor, tab_injuries, tab_grades, tab_adjust, tab_hea
 # ---- ATS Picks ----
 with tab_ats:
     st.subheader(f"Week {latest_week} — Against the Spread")
+    # Item 10: the slate's as-of date, right next to the picks it
+    # describes, so a week-old slate can never read as today's.
+    _run_times = picks_df[picks_df["week"] == latest_week]["run_time"].dropna() \
+        if "run_time" in picks_df.columns else pd.Series([], dtype=str)
+    if not _run_times.empty:
+        st.caption(f"Picks as of: {_run_times.max()} (UTC, from the last saved run). "
+                   "If that date is not this week, refresh before submitting.")
     wk_df = picks_df[picks_df["week"] == latest_week].copy()
 
     def _flag(row):
@@ -110,9 +138,40 @@ with tab_ats:
                   "vegas_total", "pool_total", "model_total", "total_pick", "weather_note"]
     if "cover_prob" in wk_df.columns:
         show_cols.insert(10, "cover_prob")
+    # Item 7 -- cover-probability range under rating uncertainty:
+    # the same calibrated CDF evaluated at the model margin shifted
+    # by +/-1 margin SD (rating bands from the latest ratings
+    # snapshot's games-played counts). A range straddling 0.50
+    # means rating uncertainty alone could flip which side is
+    # favoured -- treat that pick as a coin flip. This column is
+    # best-effort: any missing input skips it rather than breaking
+    # the picks table.
+    _cover_range = None
+    try:
+        _wk_ratings = ratings_df[ratings_df["week"] == latest_week] if not ratings_df.empty else ratings_df
+        _games_played = {r.team: int(r.games_played_this_season)
+                         for r in _wk_ratings.itertuples()
+                         if "games_played_this_season" in _wk_ratings.columns}
+        if _games_played and "model_independent" in wk_df.columns:
+            def _range_for(row):
+                _line = row["pool_spread"] if pd.notna(row.get("pool_spread")) else row.get("vegas_spread")
+                if pd.isna(row.get("model_independent")) or _line is None or pd.isna(_line):
+                    return ""
+                _lo, _hi = uncertainty.cover_prob_interval(
+                    float(row["model_independent"]), float(_line),
+                    _games_played.get(row["home_team"], 0),
+                    _games_played.get(row["away_team"], 0))
+                return f"{_lo:.2f}-{_hi:.2f}"
+            _cover_range = wk_df.apply(_range_for, axis=1)
+    except Exception:
+        _cover_range = None
+    if _cover_range is not None:
+        wk_df["cover_prob_range"] = _cover_range
+        show_cols.insert(show_cols.index("cover_prob") + 1 if "cover_prob" in show_cols else 10,
+                         "cover_prob_range")
     show = wk_df[show_cols]
     show.columns = ["Away", "Home", "Vegas Spread", "Pool Spread", "Model Spread (raw)", "Model Spread (official)",
-                     "Edge", "Pick", "Confidence", "Flag"] + (["Cover Prob"] if "cover_prob" in wk_df.columns else []) + [
+                     "Edge", "Pick", "Confidence", "Flag"] + (["Cover Prob"] if "cover_prob" in wk_df.columns else []) + (["Cover Prob Range"] if "cover_prob_range" in show_cols else []) + [
                      "Injury Flags",
                      "Vegas Total", "Pool Total", "Model Total", "Total Pick", "Weather"]
     st.dataframe(show, use_container_width=True, hide_index=True)
@@ -131,7 +190,12 @@ with tab_ats:
         "Cover Prob is the model's estimated probability the pick covers, "
         "from the raw model-vs-line gap -- near 50% means a coin flip, "
         "which matters when the same picks count for both a weekly winner "
-        "and the season-long winner (see README)."
+        "and the season-long winner (see README). Cover Prob Range is that "
+        "same probability under a +/-1 SD shift of the model margin from "
+        "rating uncertainty (item 7): a range straddling 0.50 means the "
+        "rating bands alone could flip the favoured side, so treat the "
+        "pick as a coin flip even if the point probability looks strong. "
+        "Bands are model uncertainty, not a guarantee."
     )
 
     # Line-movement review (backtest item 7, added 2026-11-04): games
@@ -271,6 +335,35 @@ with tab_submit:
     else:
         st.write("No games flagged this week -- nothing in the queue means nothing met a flag "
                  "threshold, not that the data was checked and cleared.")
+
+    # Item 6 -- what changed since the last run (Thursday 10 AM
+    # final run vs 7 AM, or Thursday 7 AM vs Tuesday). The diff
+    # survives because weekly_run persists it under its own
+    # run_time before overwriting the picks; this section reads
+    # only the latest run's rows, flips first. A change is a
+    # prompt to re-check, never an auto-switch of the pool line.
+    st.divider()
+    st.markdown("**What changed since the last run — movers only**")
+    try:
+        _diff = db.get_latest_run_diff(config.SEASON, latest_week)
+    except Exception:
+        _diff = {"run_time": None, "items": []}
+        st.error("Could not load the what-changed diff -- see the ATS tab's line-moves section instead.")
+        st.code(traceback.format_exc())
+    if _diff["run_time"] is None:
+        st.write("No what-changed diff saved yet for this week -- the next weekly run "
+                 "(including the Thursday 10 AM final run) saves one automatically. "
+                 "The first run of a week has nothing to compare against by design.")
+    elif not _diff["items"]:
+        st.write(f"Latest diff ({_diff['run_time']}, UTC): no changes above the reporting "
+                 "thresholds since the previous run -- the slate is unchanged where it matters.")
+    else:
+        st.caption(f"Latest diff run: {_diff['run_time']} (UTC). Flips first, then line moves, "
+                   "injury changes, edge moves, rating moves, weather, and totals. "
+                   "A row here means re-check that game before submitting -- it does not change a pick or a line.")
+        _d_rows = [{"Category": i["category"], "Matchup": i["matchup"], "What changed": i["detail"]}
+                   for i in _diff["items"]]
+        st.dataframe(_d_rows, hide_index=True, use_container_width=True)
 
     # Standings wiring (batch 3 API, previously unwired): labels only.
     # The default picks are unchanged by anything here; a GAMBLE label
@@ -532,16 +625,196 @@ with tab_grades:
                 st.code(traceback.format_exc())
         st.rerun()
 
+    # Item 9 -- actual pool results vs model picks. DISTINCT from the
+    # adjustment grading above: this compares the slate actually
+    # submitted to Barbara's pool against the model slate, game by
+    # game, and shows where differing picks helped or hurt. With no
+    # imported results it shows an empty state, not a 0-0 record --
+    # nothing has been submitted/graded yet, and no result is invented.
+    st.divider()
+    st.markdown("**Actual pool results vs model picks**")
+    st.caption(
+        "Import the picks you actually submitted (CSV, or one game at a time below) "
+        "and grade them against the model picks on the same games and the same judged "
+        "line (pool line where set, else live Vegas). 'Same' games count for both "
+        "slates; only differing games move the net difference. Judge over a season, "
+        "not one week.")
+    _submitted = pool_results.load_pool_results(config.SEASON)
+    if not _submitted:
+        st.info("No actual pool results imported yet for this season -- nothing to grade. "
+                "Import a CSV below, or add games manually, after you submit a week.")
+    else:
+        st.write(f"{len(_submitted)} submitted game(s) imported "
+                 f"(weeks {min(r['week'] for r in _submitted)}-"
+                 f"{max(r['week'] for r in _submitted)}).")
+    with st.expander("CSV format for actual pool results"):
+        st.code("season,week,away_team,home_team,submitted_team,note\n"
+                "2026,1,DEN,KC,KC,flipped on Thursday review\n"
+                "2026,1,BUF,MIA,MIA,\n",
+                language="csv")
+        st.caption("submitted_team is the team you actually submitted. You may give "
+                   "submitted_pick instead (a pick string like 'KC -3.5'); a submitted "
+                   "team that plays in neither team of its matchup is rejected, not guessed. "
+                   "Re-importing a corrected CSV replaces that game's pick; it never duplicates it.")
+        st.download_button("Download a sample CSV (SAMPLE ONLY -- not real results)",
+                           data=pool_results.SAMPLE_CSV,
+                           file_name="pool_results_sample.csv", mime="text/csv")
+    _uploaded = st.file_uploader("Upload actual pool results CSV", type=["csv"], key="pool_results_csv")
+    if _uploaded is not None and st.button("Import uploaded CSV"):
+        try:
+            _text = _uploaded.read().decode("utf-8")
+            _imp = pool_results.import_pool_results_csv(_text)
+            if _imp["errors"]:
+                st.warning("Import notes / rejected rows: " + " | ".join(_imp["errors"]))
+            st.success(f"Imported {_imp['imported']} submitted game(s).")
+        except Exception:
+            st.error("Could not import that CSV. Error detail:")
+            st.code(traceback.format_exc())
+        st.rerun()
+    with st.form("pool_result_manual_form"):
+        st.caption("Add one submitted game manually:")
+        _m_week = st.number_input("Week", value=latest_week, min_value=1, step=1)
+        _week_picks = picks_df[picks_df["week"] == int(_m_week)]
+        if _week_picks.empty:
+            st.caption("No model picks saved for that week yet -- add the game after a run saves them.")
+            _m_submit = st.form_submit_button("Save submitted pick")
+        else:
+            _matchups = [f"{r.away_team} @ {r.home_team}" for r in _week_picks.itertuples()]
+            _m_matchup = st.selectbox("Game", _matchups)
+            _m_away, _m_home = _m_matchup.split(" @ ")
+            _m_team = st.selectbox("Team actually submitted", [_m_away, _m_home])
+            _m_note = st.text_input("Note (optional, e.g. flipped on Thursday review)")
+            _m_submit = st.form_submit_button("Save submitted pick")
+            if _m_submit:
+                pool_results.save_pool_results([{"season": config.SEASON, "week": int(_m_week),
+                                                 "away_team": _m_away, "home_team": _m_home,
+                                                 "submitted_team": _m_team, "note": _m_note}])
+                st.success(f"Saved submitted pick {_m_team} for {_m_matchup} (week {int(_m_week)}).")
+                st.rerun()
+    if _submitted and st.button("📊 Grade Submitted vs Model Now"):
+        with st.spinner("Pulling actual results and grading submitted vs model picks..."):
+            try:
+                from nflpicks import data as _data2
+                _games2 = _data2.load_games(config.SEASON)
+                _results2 = {(int(r["season"]), int(r["week"]), r["away_team"], r["home_team"]): float(r["result"])
+                             for _, r in _games2[_games2["result"].notna()].iterrows()}
+                _pool = pool_results.grade_season_from_db(config.SEASON, _results2)
+                if _pool["status"] == "empty":
+                    st.info(_pool["note"])
+                else:
+                    st.success(f"Model: {_pool['model']['record']} ({_pool['model']['ats_pct']}% ATS) | "
+                               f"Submitted: {_pool['submitted']['record']} ({_pool['submitted']['ats_pct']}% ATS) | "
+                               f"{_pool['net_note']}")
+                    _diff_rows = [g for g in _pool["per_game"] if g["outcome"] != "same"]
+                    if _diff_rows:
+                        st.markdown("**Games where the submitted pick differed from the model pick**")
+                        st.dataframe(_diff_rows, hide_index=True, use_container_width=True)
+                    else:
+                        st.write("No differing games graded yet -- every graded submitted pick matched the model pick.")
+                    if _pool["ungraded"]["no_result"] or _pool["ungraded"]["no_model_pick"]:
+                        st.caption(f"Ungraded: {_pool['ungraded']} (games with no result or no model pick yet).")
+            except Exception:
+                st.error("Something went wrong while grading submitted picks. Error detail:")
+                st.code(traceback.format_exc())
+
+    # Item 3 -- error decomposition of this season's graded picks.
+    # Same slice logic as the backtest harness (--decompose): ATS%/MAE
+    # by spread, fav/dog, side, season phase, team, total, weather, and
+    # division, always with sample sizes. Slices below 30 decided games
+    # are flagged small -- a losing slice is a target for a future
+    # walk-forward fix, not a reason to flip picks in that slice.
+    st.divider()
+    st.markdown("**Error decomposition — where this season's model loses**")
+    st.caption(
+        "Uses this season's saved picks against actual results (same judged line as the "
+        "gradings above). MAE uses the model's raw spread where available. Total / "
+        "division / wind context comes from the schedule file when it has it; games "
+        "without it land in 'unknown' buckets, and the coverage counts say how many.")
+    if st.button("📊 Decompose This Season's Errors"):
+        with st.spinner("Pulling actual results and decomposing graded picks..."):
+            try:
+                from nflpicks import data as _data3
+                _games3 = _data3.load_games(config.SEASON)
+                _results3 = {(int(r["season"]), int(r["week"]), r["away_team"], r["home_team"]): float(r["result"])
+                             for _, r in _games3[_games3["result"].notna()].iterrows()}
+                with db.connect() as _conn:
+                    _pick_rows = [dict(r) for r in _conn.execute(
+                        "SELECT * FROM picks WHERE season=?", (config.SEASON,)).fetchall()]
+                _rows = error_decomposition.normalize_pick_rows(_pick_rows, _results3)
+                _rows = error_decomposition.attach_context(_rows, _games3)
+                _dec = error_decomposition.decompose(_rows)
+                if _dec["status"] == "empty":
+                    st.info(_dec["note"])
+                else:
+                    _ov = _dec["overall"]
+                    st.write(f"Overall: {_ov['wins']}-{_ov['losses']} ATS "
+                             f"({_ov['ats_pct']}% on {_ov['decided']} decided games, "
+                             f"{_ov['pushes']} pushes), MAE {_ov['mae']} vs line MAE {_ov['line_mae']} "
+                             f"(gap {_ov['mae_gap']:+} pts). Coverage: total known "
+                             f"{_dec['coverage']['total_known']}/{_dec['n']}, division known "
+                             f"{_dec['coverage']['div_known']}/{_dec['n']}, wind known "
+                             f"{_dec['coverage']['wind_known']}/{_dec['n']}.")
+                    if _dec["worst_slices"]:
+                        st.markdown("**Worst qualified slices (30+ decided games only)**")
+                        st.dataframe(_dec["worst_slices"], hide_index=True, use_container_width=True)
+                    for _dim, _table in _dec["slices"].items():
+                        st.markdown(f"**By {_dim}**")
+                        st.dataframe([{"slice": k, **v} for k, v in _table.items()],
+                                     hide_index=True, use_container_width=True)
+                    st.caption(_dec["note"])
+            except Exception:
+                st.error("Something went wrong while decomposing errors. Error detail:")
+                st.code(traceback.format_exc())
+
 # ---- Manual adjustments ----
 with tab_adjust:
     st.subheader("Manual Adjustments")
     st.caption("Your call on injuries, weather, or anything else the model doesn't see. "
                "These feed directly into next run's ratings and are logged to Decision Log. "
-               "Note: on Streamlit Cloud these live in that deployment's database only -- "
-               "a redeploy can lose them. The GitHub Action workflow commits the "
-               "runner's database back to the repo, but it cannot commit adjustments "
-               "made inside a Cloud deployment. Keep a note of important adjustments.")
+               "Note: on Streamlit Cloud the table below still lives in that deployment's "
+               "database only -- a redeploy can lose it. The durable copy is the versioned "
+               "file manual_adjustments.json in the repo, which the weekly run reads "
+               "(file wins per team; database-only teams still apply until exported, so "
+               "nothing is silently dropped). A Cloud deployment cannot write that repo "
+               "file -- use Export below, then commit the download to the repo, to make "
+               "adjustments survive redeploys and reach the weekly run.")
     st.dataframe(adj_df, hide_index=True, use_container_width=True)
+
+    st.markdown("**Repo file: export / import** (batch 3, item 5)")
+    st.caption("Export downloads the merge of this dashboard's database and the repo file "
+               "(file wins per team), with its audit history -- commit that download as "
+               "manual_adjustments.json. Import reads an uploaded manual_adjustments.json "
+               "into this deployment's database (merge, not wipe) so the adjustments work "
+               "here; it does NOT write the repo file, so commit the file itself too if "
+               "you want the weekly run to see the change.")
+    try:
+        _export_doc = manual_adjustments.build_export_doc()
+        st.download_button("⬇️ Export manual_adjustments.json",
+                           data=json.dumps(_export_doc, indent=2, sort_keys=True) + "\n",
+                           file_name="manual_adjustments.json", mime="application/json")
+        st.caption(f"Export covers {len(_export_doc['adjustments'])} team(s); "
+                   f"repo file revision {_export_doc['revision']}.")
+    except Exception:
+        st.error("Could not build the export file. Error detail:")
+        st.code(traceback.format_exc())
+    _upload = st.file_uploader("Import manual_adjustments.json", type=["json"])
+    if _upload is not None and st.button("Import into this dashboard's database"):
+        try:
+            # Database only, on purpose: parse_import_entries never
+            # touches the repo file, which a Cloud deployment cannot
+            # durably write. Commit the uploaded file itself to the
+            # repo if you want the weekly run to see the change.
+            _entries = manual_adjustments.parse_import_entries(
+                _upload.read().decode("utf-8"))
+            for _e in _entries:
+                db.set_manual_adjustment(_e["team"], _e["points"], _e["reason"])
+            st.success(f"Imported {len(_entries)} team(s) into this deployment's "
+                       "database (merge, not wipe). This did NOT write the repo "
+                       "file -- commit the file itself for the weekly run to see it.")
+            st.rerun()
+        except Exception:
+            st.error("Import failed -- nothing was applied. Error detail:")
+            st.code(traceback.format_exc())
 
     with st.form("add_adjustment"):
         c1, c2, c3 = st.columns([1, 1, 2])
@@ -586,12 +859,34 @@ with tab_health:
     else:
         display_cols = ["team", "rating", "raw_point_diff_prior_season", "games_played_this_season"]
         display_cols = [c for c in display_cols if c in wk_ratings.columns]
+        _ratings_show = wk_ratings[display_cols].copy()
+        # Item 7 -- rating bands: 90% interval from games played.
+        # Best-effort, like the ATS cover-prob range: any missing
+        # input skips the column rather than breaking the table.
+        try:
+            if "rating" in _ratings_show.columns and "games_played_this_season" in _ratings_show.columns:
+                _ratings_show["rating_band_90"] = [
+                    f"{lo:+.1f} to {hi:+.1f}"
+                    for lo, hi in (uncertainty.rating_interval(r.rating, int(r.games_played_this_season))
+                                   for r in _ratings_show.itertuples())
+                ]
+                display_cols = display_cols + ["rating_band_90"]
+        except Exception:
+            pass
         st.dataframe(
-            wk_ratings[display_cols].rename(columns={
+            _ratings_show[display_cols].rename(columns={
                 "games_played_this_season": "games played (current season)",
                 "raw_point_diff_prior_season": "raw avg point diff (prior season, unadjusted)",
+                "rating_band_90": "rating 90% band (model uncertainty, not a guarantee)",
             }),
             hide_index=True, use_container_width=True,
+        )
+        st.caption(
+            "The 90% band widens early in the season (few current-season games, "
+            "prior-season rating doing most of the work) and narrows as games "
+            "accumulate -- it stops narrowing late because recency weighting "
+            "caps the effective sample size (see uncertainty.py). A band that "
+            "crosses zero means the rating's sign itself is uncertain."
         )
         st.caption(
             "The raw point diff column is a simple, unadjusted sanity check -- a team that outscored "
