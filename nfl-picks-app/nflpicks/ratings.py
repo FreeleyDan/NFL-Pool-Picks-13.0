@@ -275,6 +275,85 @@ def rating_confidence(games_played: int) -> float:
     return base + (1 - base) * min(1.0, games_played / config.MIN_GAMES_FOR_FULL_CONFIDENCE)
 
 
+def team_home_field_detail(
+    played_current: pd.DataFrame,
+    played_prior: pd.DataFrame,
+    ratings: dict[str, float],
+    league_hfa: float,
+    shrinkage_games: float | None = None,
+) -> dict[str, dict]:
+    """Per-team shrunk home-field advantage (batch 4, group B item 4).
+
+    For each team's pre-week home games (neutral-site games excluded --
+    there is no home field there), the raw team estimate is the mean
+    residual: actual home margin minus the ratings-implied margin
+    WITHOUT any HFA term (rating_home - rating_away). That residual
+    averages league HFA plus the team's own deviation, so the shrunk
+    estimate pulls it toward the league number by sample size::
+
+        shrunk = league + (raw - league) * n / (n + K)
+
+    with K = config.TEAM_HFA_SHRINKAGE_GAMES (25 by default), then
+    clamped to [HFA_MIN, HFA_MAX]. Teams with no pre-week home games
+    get exactly the league number (n=0 -> weight 0); teams absent
+    from `ratings` are skipped, and callers fall back to the league
+    number for them. The estimate is deliberately computed against
+    the SAME ratings used for the pick (the blended ratings for the
+    target week): residuals are therefore in-sample w.r.t. the
+    ratings, which is exactly why shrinkage is essential and why the
+    walk-forward harness -- not this estimate's in-sample fit -- is
+    the promotion test. Nothing live reads this: TEAM_HFA_LIVE stays
+    False and the only consumer is the backtest team_hfa variant.
+    Returns {team: {"n": int, "raw": float|None, "shrunk": float}}."""
+    if shrinkage_games is None:
+        shrinkage_games = float(getattr(config, "TEAM_HFA_SHRINKAGE_GAMES", 25))
+    frames = [df for df in (played_current, played_prior)
+              if df is not None and len(df)]
+    residuals: dict[str, list[float]] = {}
+    if frames:
+        played = pd.concat(frames, ignore_index=True)
+        for _, row in played.iterrows():
+            if str(row.get("location") or "").strip().lower() == "neutral":
+                continue
+            home, away = row["home_team"], row["away_team"]
+            if home not in ratings or away not in ratings:
+                continue
+            try:
+                actual = float(row["home_score"]) - float(row["away_score"])
+            except (TypeError, ValueError):
+                continue
+            residuals.setdefault(home, []).append(
+                actual - (float(ratings[home]) - float(ratings[away])))
+    out: dict[str, dict] = {}
+    for team in sorted(set(ratings) | set(residuals)):
+        vals = residuals.get(team, [])
+        n = len(vals)
+        raw = (sum(vals) / n) if n else None
+        if raw is None:
+            shrunk = float(league_hfa)
+        else:
+            w = n / (n + shrinkage_games) if shrinkage_games > 0 else 1.0
+            shrunk = float(league_hfa) + (raw - float(league_hfa)) * w
+        shrunk = max(config.HFA_MIN, min(config.HFA_MAX, shrunk))
+        out[team] = {"n": n, "raw": (round(raw, 3) if raw is not None else None),
+                     "shrunk": round(shrunk, 3)}
+    return out
+
+
+def team_home_field(
+    played_current: pd.DataFrame,
+    played_prior: pd.DataFrame,
+    ratings: dict[str, float],
+    league_hfa: float,
+    shrinkage_games: float | None = None,
+) -> dict[str, float]:
+    """{team: shrunk HFA} convenience wrapper over
+    team_home_field_detail -- the form the harness variant consumes."""
+    detail = team_home_field_detail(
+        played_current, played_prior, ratings, league_hfa, shrinkage_games)
+    return {t: d["shrunk"] for t, d in detail.items()}
+
+
 def audit_team_game_counts(played_prior: pd.DataFrame) -> list[str]:
     """
     Sanity check on the prior-season data that feeds every Week 1-3

@@ -8,7 +8,7 @@ import traceback
 import pandas as pd
 import streamlit as st
 
-from nflpicks import adjustment_grading, config, db, error_decomposition, freshness, grading, manual_adjustments, pool_results, review_queue, run_diff, standings, submission, uncertainty
+from nflpicks import adjustment_grading, committed_db, config, db, error_decomposition, experiment, freshness, grading, manual_adjustments, pool_results, pool_standings, review_queue, run_diff, standings, submission, uncertainty
 import weekly_run
 
 st.set_page_config(page_title="NFL Pool Picks", layout="wide")
@@ -87,6 +87,69 @@ elif _fresh["level"] == "warn":
     if _fresh.get("failed_steps"):
         st.warning("Failed step(s) on the last run: " + "; ".join(
             f"{s['step']}: {s['detail']}" for s in _fresh["failed_steps"]))
+
+# ---- Committed-DB check (batch 4, group D, item 8) ----
+# The workflow commits nfl_picks.db to the repo every run; this
+# deployment reads its own local copy, which can diverge (a
+# lagged/failed redeploy, or a dashboard Refresh the workflow
+# never committed back). When a committed source is configured
+# (PICKS_COMMITTED_DB_URL, PICKS_COMMITTED_DB_FILE, or
+# PICKS_GITHUB_REPO -- see README item 8), this section compares
+# the two slates on load and offers an explicit sync. It never
+# auto-overwrites on load (that would destroy a just-clicked
+# Refresh), never prints a token, and never claims a check
+# happened when no source is configured. A fetch failure falls
+# back to the local slate with a warning, never a crash.
+try:
+    _src = committed_db.describe_source()
+    if _src["mode"] == "local":
+        st.caption("Data source: this deployment's local database only. "
+                   "No committed-DB source is configured, so this page cannot "
+                   "check itself against the workflow-committed slate -- a "
+                   "lagged redeploy or a dashboard Refresh could leave it "
+                   "diverged. Set PICKS_COMMITTED_DB_URL, "
+                   "PICKS_COMMITTED_DB_FILE, or PICKS_GITHUB_REPO (plus "
+                   "PICKS_GITHUB_TOKEN for a private repo) to enable the check.")
+    else:
+        _cmp = committed_db.compare_to_local()
+        if _cmp["status"] == "unreachable":
+            st.warning("⚠️ Committed-DB check failed: " + _cmp["note"])
+        elif _cmp["status"] == "diverged":
+            st.warning("⚠️ " + _cmp["note"])
+            st.caption(f"Committed run: {_cmp['committed']['run_time']} "
+                       f"({_cmp['committed']['games']} games, week {_cmp['committed']['week']}) | "
+                       f"Local run: {_cmp['local']['run_time']}. "
+                       "Note: raw GitHub fetches can lag a fresh push by minutes "
+                       "(CDN cache) -- check the committed run time above against "
+                       "the expected Thursday run before trusting a sync.")
+            if st.button("Sync this dashboard to the committed slate"):
+                try:
+                    _sync = committed_db.sync_committed_to_local(
+                        snapshot_path=_cmp.get("snapshot_path"))
+                    st.success(_sync["note"])
+                except Exception:
+                    st.error("Sync failed -- local slate unchanged. Error detail:")
+                    st.code(traceback.format_exc())
+                finally:
+                    if _cmp.get("snapshot_path"):
+                        try:
+                            import os as _os
+                            _os.unlink(_cmp["snapshot_path"])
+                        except OSError:
+                            pass
+                st.rerun()
+        elif _cmp["status"] == "ok":
+            st.caption(f"Data source: local slate matches the committed slate "
+                       f"(run {_cmp['committed']['run_time']}).")
+        if _cmp.get("snapshot_path"):
+            try:
+                import os as _os
+                _os.unlink(_cmp["snapshot_path"])
+            except OSError:
+                pass
+except Exception:
+    st.caption("Committed-DB check could not run -- showing the local slate as-is.")
+    st.code(traceback.format_exc())
 
 tab_names = ["ATS Picks", "Submit & Review", "Survivor Pool", "Injury Review", "Model Grades", "Manual Adjustments", "Data Health"]
 if picks_df.empty:
@@ -373,15 +436,58 @@ with tab_submit:
     st.caption("Enter your actual season ATS wins and the leader's, plus weeks left INCLUDING "
                "this week (final week = 1). Early in the season (5+ weeks left) the rule is "
                "off no matter the standings. Full-season simulation costing "
-               "(simulation.compare_gambles) is NOT run here: it needs cover probabilities "
-               "for the whole remaining schedule, and this database stores only this week's "
-               "picks -- see README for where that wiring goes. The expected-win cost shown "
+               "over the whole remaining schedule is NOT run here: it needs cover probabilities "
+               "for every remaining game, and this database stores only this week's "
+               "picks -- see README for where that wiring goes. What IS priced below, "
+               "once you check labels, is this week's gambles against the standings "
+               "in the form (one-week pricing only -- see its caveat). The expected-win cost shown "
                "with each GAMBLE comes from standings.suggest_gambles itself.")
+    # Item 9 (batch 4, group D): imported standings snapshot.
+    # Same pattern as the pool-results import in Model Grades:
+    # CSV import (upsert per season/week, last row wins), empty
+    # state when nothing is imported, never an invented record.
+    # When a snapshot exists it pre-fills the form below; the
+    # form values (imported or typed) are what get priced.
+    try:
+        _snap = pool_standings.latest_standings(config.SEASON)
+    except Exception:
+        _snap = {"status": "empty"}
+    with st.expander("Import pool standings (CSV) -- item 9"):
+        st.code("season,week,user_wins,leader_wins,weeks_left,leader_name,note\n"
+                "2026,10,118,120,4,,after week 9 results posted\n",
+                language="csv")
+        st.caption("user_wins = your season ATS wins so far; leader_wins = the "
+                   "CURRENT leader's wins (not second place -- if you lead, enter "
+                   "your own wins as leader_wins). weeks_left INCLUDES this week "
+                   "(final week = 1). Re-importing a corrected CSV replaces that "
+                   "week's snapshot; it never duplicates it. With nothing imported, "
+                   "the form below starts at 0 / 0 / 4 and you type the numbers in.")
+        st.download_button("Download a sample CSV (SAMPLE ONLY -- not real standings)",
+                           data=pool_standings.SAMPLE_CSV,
+                           file_name="pool_standings_sample.csv", mime="text/csv")
+        _up_stand = st.file_uploader("Upload pool standings CSV", type=["csv"], key="pool_standings_csv")
+        if _up_stand is not None and st.button("Import uploaded standings CSV"):
+            try:
+                _imp_s = pool_standings.import_pool_standings_csv(_up_stand.read().decode("utf-8"))
+                if _imp_s["errors"]:
+                    st.warning("Import notes / rejected rows: " + " | ".join(_imp_s["errors"]))
+                st.success(f"Imported {_imp_s['imported']} standings snapshot(s).")
+            except Exception:
+                st.error("Could not import that CSV. Error detail:")
+                st.code(traceback.format_exc())
+            st.rerun()
+    if _snap.get("status") == "ok":
+        st.write("Imported standings snapshot: " + _snap["note"])
+        _def_user, _def_leader, _def_weeks = int(_snap["user_wins"]), int(_snap["leader_wins"]), int(_snap["weeks_left"])
+    else:
+        st.info("No pool standings imported yet for this season -- type the numbers in below, "
+                "or import a CSV above so next week's form is pre-filled from real standings.")
+        _def_user, _def_leader, _def_weeks = 0, 0, 4
     with st.form("standings_form"):
         sc1, sc2, sc3 = st.columns(3)
-        user_wins_in = sc1.number_input("Your season ATS wins", value=0, min_value=0, step=1)
-        leader_wins_in = sc2.number_input("Leader's season ATS wins", value=0, min_value=0, step=1)
-        weeks_left_in = sc3.number_input("Weeks left (incl. this week)", value=4, min_value=0, step=1)
+        user_wins_in = sc1.number_input("Your season ATS wins", value=_def_user, min_value=0, step=1)
+        leader_wins_in = sc2.number_input("Leader's season ATS wins", value=_def_leader, min_value=0, step=1)
+        weeks_left_in = sc3.number_input("Weeks left (incl. this week)", value=_def_weeks, min_value=0, step=1)
         standings_clicked = st.form_submit_button("Check standings labels")
     if standings_clicked:
         s_games, skipped = [], []
@@ -407,6 +513,32 @@ with tab_submit:
             st.dataframe(s_rows, hide_index=True, use_container_width=True)
             if skipped:
                 st.caption("Skipped (no cover prob or no pick): " + "; ".join(skipped))
+            # One-week simulation pricing (item 9): the week's
+            # GAMBLE labels priced against the standings in the
+            # form, via pool_standings.price_week_gambles. This is
+            # ONE-WEEK pricing only -- P(ahead after this week),
+            # not season-end P(first) -- because only this week's
+            # cover probabilities exist in this database. The
+            # caveat travels with the numbers; do not quote the
+            # delta as a season-end odds move.
+            try:
+                _price_games = []
+                for _g in s_games:
+                    _ph = _g["pick_prob"] if _g["default_side"] == "home" else 1.0 - _g["pick_prob"]
+                    _price_games.append({**_g, "p_home": _ph})
+                _price = pool_standings.price_week_gambles(
+                    _price_games,
+                    {"status": "ok", "season": config.SEASON, "week": latest_week,
+                     "user_wins": int(user_wins_in), "leader_wins": int(leader_wins_in),
+                     "weeks_left": int(weeks_left_in)})
+                _sim = _price["simulation"]
+                st.write("**One-week gamble pricing (this week only, not season-end):** "
+                         f"{_sim['label']} -- delta P(ahead after this week) "
+                         f"{_sim['delta_p_first_pp']:+} pp, expected cost "
+                         f"{_sim['expected_cost_wins']:+} wins. {_sim['note']}")
+            except Exception:
+                st.error("One-week gamble pricing failed -- labels above are unaffected.")
+                st.code(traceback.format_exc())
         except Exception:
             st.error("Standings check failed -- check the inputs (all must be non-negative).")
             st.code(traceback.format_exc())
@@ -593,6 +725,34 @@ with tab_grades:
         st.write("No graded games yet -- click the button above once some of this week's games have finished.")
     else:
         st.dataframe(grades_df, hide_index=True, use_container_width=True)
+
+    # Item 10 (batch 4, group D): which model produced the slate
+    # being graded. One row per weekly run (fingerprint of flags
+    # + params); a grade change across weeks with the SAME
+    # fingerprint is not a model change, whatever the grade did.
+    # No experiment row (runs before this batch, or a run whose
+    # tracking failed) is reported as unknown, never guessed.
+    st.divider()
+    st.markdown("**Which model produced this slate? (experiment tracking)**")
+    try:
+        _exp = experiment.latest_experiment(config.SEASON, latest_week)
+    except Exception:
+        _exp = None
+    if _exp is None:
+        st.info("No experiment record for this season/week yet -- the next weekly run "
+                "records one automatically (model version, flag set, blend, fingerprint). "
+                "Grades from before that record cannot be attributed to a recorded model change.")
+    else:
+        _flags_on = sorted(k for k, v in _exp["flags"].items() if v is True)
+        st.write(f"Latest run fingerprint: `{_exp['fingerprint']}` | version label: "
+                 f"{_exp['model_version']} | git: {_exp['git_head'] or 'unknown'} | "
+                 f"run: {_exp['run_time']} | picks: {_exp['picks_count']}")
+        st.write("Flags live that week: " + (", ".join(_flags_on) if _flags_on else
+                 "none -- all shadow flags off (the normal state)."))
+        st.caption("Parameters recorded with the fingerprint: " +
+                   ", ".join(f"{k}={v}" for k, v in _exp["params"].items()) +
+                   ". Full timeline: python -m nflpicks.experiment --season "
+                   f"{config.SEASON} (see README batch-4 group D item 10).")
 
     # 7c -- manual adjustments graded separately from model picks.
     st.divider()

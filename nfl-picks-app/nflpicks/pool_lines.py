@@ -50,14 +50,18 @@ noted in errors. A rejected row never reaches grading.
 
 Grading rule (deliberate, so the comparison is clean): the SAME
 rule as `backtest.evaluate_variant` (the canonical harness) is
-applied to both lines -- actual > line: correct iff model margin >
-line; actual < line: correct iff model margin < line; actual ==
-line: push. That is NOT the batch-2 `_ats_rows` rule, which grades
-a margin exactly equal to the line as a push. Using one rule for
-both lines means any recorded-vs-pool difference is purely a line
-difference, never a grading-rule difference; a model margin exactly
-equal to a line is a pick (the away side, since it is not > line)
-under this rule, on either line.
+applied to both lines -- margin == line or actual == line: push
+(no pick); otherwise actual > line: correct iff model margin >
+line, actual < line: correct iff model margin < line. Before
+batch 4 this module deliberately used the old canonical rule
+(margin == line counted as a pick on the away side) so the
+comparison was purely a line difference; batch 4 corrected the
+canonical rule itself, so this module follows it -- using one
+rule for both lines still means any recorded-vs-pool difference
+is purely a line difference, never a grading-rule difference.
+A margin exactly equal to one line is now a push against that
+line and a pick against the other, which is the correct
+statement of "no lean vs this line, lean vs that line".
 
 What this module is NOT:
 * It is not a pick input and it never switches a line: grading
@@ -217,11 +221,11 @@ def load_pool_lines_file(path: str | Path | None = None) -> dict:
 
 def _grade_pick(model_margin: float, line: float, actual_margin: float) -> str:
     """Canonical harness ATS outcome for one pick against one line:
-    'correct' / 'wrong' / 'push' (actual == line). A model margin
-    exactly equal to the line is a pick (away side), not a push --
-    see the module docstring for why this rule, and only this rule,
-    is used for both lines."""
-    if actual_margin == line:
+    'correct' / 'wrong' / 'push'. Batch 4: a model margin exactly
+    equal to the line is a push (no pick), matching
+    backtest.evaluate_variant -- see the module docstring for why
+    this rule, and only this rule, is used for both lines."""
+    if model_margin == line or actual_margin == line:
         return "push"
     if actual_margin > line:
         return "correct" if model_margin > line else "wrong"

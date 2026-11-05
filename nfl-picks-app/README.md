@@ -1565,3 +1565,1129 @@ weekly run does not fetch play-by-play, and the dashboard
 shows nothing from this module -- that wiring waits for a
 walk-forward win that this run did not produce. No GitHub
 push was made for this item (local files only).
+
+## Backtest batch 4 (2026-11-04, group A items 1-2) -- tie-grading correction + first error-decomposition read
+
+Naming note: an earlier section above is titled "Backtest batch 4
+(item 8)" for the totals model; that was batch 3's numbering. THIS
+section is the parent task's Batch 4, group A, items 1-2 only. Items
+3+ of this batch are not covered here.
+
+**The bridge -- read before quoting any canonical number.** Every
+"canonical" number in earlier sections (49.12% ATS) was computed
+under a grading bug, and those sections are left intact as the
+historical record -- they are NOT silently rewritten. The bug: in
+`backtest.evaluate_variant`, a model margin exactly equal to the
+line could never be > or < the line, so it was counted WRONG
+whenever the game was decided. Model margins are rounded to 1
+decimal and lines sit on .0/.5, so 34 baseline margins land
+exactly on the line in 2019-2025 (33 decided, 1 actual-push).
+The correction (this batch): a margin exactly equal to the line
+is a PUSH (no pick), excluded from ATS% but counted, matching
+the batch-2 `_ats_rows` rule that the batch-2 internal baseline
+already used. That is why the batch-2 internal baseline
+(50.03%) and the corrected canonical baseline are the same
+number -- batch 2 was right, the canonical harness was wrong.
+
+| | Old rule | Corrected rule |
+|---|---|---|
+| Baseline ATS, 2019-2025 (n=1,871) | 49.12% (898/1,828) | **50.03% (898/1,795)** |
+| Pushes | 43 (actual == line only) | 76 (43 actual + 34 margin - 1 both) |
+| MAE | 10.34 | 10.34 (unchanged -- grading never touched MAE) |
+| Recorded-line MAE | 9.83 | 9.83 (unchanged) |
+
+Same 898 wins, 33 fewer decided games -- the entire move is the
+33 tie games leaving the denominator. Per season, old -> new
+ATS% (decided old -> new): 2019 47.97 -> 49.17 (246 -> 240);
+2020 51.56 -> 52.80 (256 -> 250); 2021 47.01 -> 47.91
+(268 -> 263); 2022 52.87 -> 53.08 (261 -> 260); 2023 46.12 ->
+46.67 (258 -> 255); 2024 51.12 -> 51.50 (268 -> 266); 2025
+47.23 -> 49.04 (271 -> 261). Still below ~52.4% breakeven, still
+trailing the line on MAE (10.34 vs 9.83). This correction is a
+bookkeeping fix, not an edge: the model did not get better, the
+ruler did.
+
+**What else changed, and what deliberately did not.** Changed
+to the corrected rule, with tests: `backtest.evaluate_variant`
+(the fix itself; `pick_margin` is now stored per row so the
+shrunk-margin calibrated_pick tie is graded on the margin the
+pick used, not the raw margin), `pbp_features._grade_rows`
+(which had deliberately used the old rule to match 49.12%),
+`pool_lines._grade_pick` (same rule on both lines, so a margin
+equal to one line is now a push against that line and a pick
+against the other), and `error_decomposition.normalize_row`
+(which claimed the push rule in its docstring but only checked
+actual == line, so it re-graded tie-margin rows wrong -- now
+fixed, which is what makes the item-2 read below consistent
+with the harness). Unchanged, on purpose, with reasons:
+`grading.py` already excluded tie-margin picks from its counts
+(pred != vegas gate), so its outcome already matched; `pool_results`
+and `adjustment_grading` grade sides actually submitted, where a
+margin tie cannot occur, and actual == line was already a push
+there; `elo_variants._grade` and `staleness.py` already used
+the push rule; `ensemble.evaluate_weights` is a training
+objective, not a grading/reporting path (its reported summaries
+go through the already-correct `_ats_rows`), so it was left
+alone rather than conflated with reporting. New in the harness:
+`backtest.placebo_rows(frame, seed, magnitude=0.15)` -- the
+placebo gate as a reusable function, not a one-off script.
+
+**Item 1 -- Fix tie grading, then re-test everything small:
+built, tested, NOTHING promoted.** All runs below are
+point-in-time 2019-2025, recorded-line caveat unchanged, paired
+comparisons against the corrected baseline (1,795 decided)
+unless stated. Absolute ATS% across variants is NOT comparable
+when decided counts differ (a variant that picks tie games has
+more decided games); the paired delta is the honest comparison.
+
+- Placebo gate, 200 seeds of random +/-0.15 pt adjustments (no
+  data at all) on the corrected baseline: absolute ATS mean
+  49.83% (SD 0.23, p5 49.45, p95 50.22); paired delta mean
+  -0.195 pp (SD 0.175, p95 +0.11). Compare batch 3, old rule:
+  one placebo seed scored 50.33% with paired z=3.77 -- a
+  "better" headline than the red-zone feature. Under corrected
+  grading the placebo is what it should be: nothing. Two
+  honesty notes: the paired mean is slightly negative because
+  the baseline happens to win 61.3% on |edge| = 0.1 games
+  (19/31 -- small sample, not a finding), and flipping half of
+  those drags the placebo down; and a single placebo seed's
+  paired z reached 3.30 in absolute value, because tiny
+  adjustments have tiny discordant sets and z is volatile
+  there -- so the gate is the paired-delta DISTRIBUTION and
+  the absolute-ATS distribution, never one seed's z. A tiny
+  feature must clear the placebo p95s (paired +0.11 pp,
+  absolute 50.22%), not just the baseline.
+- Play-by-play features (re-run, pbp files re-downloaded from
+  the confirmed URL to scratch, not committed): early-down
+  alone 49.67% absolute, paired -0.22 pp (z=-0.49);
+  red-zone alone 50.11% absolute, paired **0.00 pp (z=0.00,
+  discordant 1/1)**; both together 50.11% absolute, paired
+  +0.11 pp (z=0.25). The red-zone "win" vanishes completely:
+  its old paired z=4.02 was entirely the tie artifact. Audit:
+  red-zone's absolute correct count rises 898 -> 916, and all
+  18 of those extra correct picks are tie games the feature
+  happens to pick (18/33 = 54.5%, a coin flip); on
+  mutually-decided games it flips exactly 2 games, 1 right and
+  1 wrong. MAE: early-down 10.35, red-zone 10.34, both 10.35
+  vs baseline 10.34 -- no MAE win either. `PBP_FEATURES_LIVE`
+  stays False.
+- Batch-2 proxy features and ensemble (re-run with team stats
+  fetched fresh): numbers reproduce EXACTLY, because
+  `_ats_rows` was already push-correct -- this is independent
+  confirmation that the corrected canonical baseline (50.03%)
+  equals the batch-2 internal baseline. Features, paired:
+  all-features +0.78 pp (z=0.86, MAE worse); explosive 0.00
+  (z=0.00 -- its earlier flips were all tie artifacts, now
+  literally zero discordants); pressure allowed +0.17
+  (z=0.33); pressure generated 0.00; pass share +0.17
+  (z=1.00, the best of the family -- nominal p ~0.32,
+  Bonferroni across the 8 feature tests = 1.0); first-down
+  -0.11 (z=-0.18); wind_pass -0.06 (z=-0.45); ol_rush -0.17
+  (z=-0.32). Ensemble: MAE-objective still collapses to 100%
+  market (no picks); ATS-objective 50.89%, paired +0.97
+  (z=0.75); equal-weight 51.18%, paired +0.84 (z=0.81); Elo
+  component 52.52%, paired +2.28 (z=1.75, unchanged conclusion:
+  nominally above breakeven but season-inconsistent and not
+  Bonferroni-significant across ~12 variants); SOS-EPA
+  component 51.14%, paired +1.02 (z=0.83). Nothing promoted.
+- SOS-EPA 50% combo (`epa_sos` variant, corrected grading):
+  51.16% absolute (926/1,810), paired +0.73 pp (z=0.86) --
+  DOWN from the old-rule paired +1.53 pp (z=1.76), because
+  roughly half the old paired gain was tie games counted
+  one-directionally. Still positive, still noise, still below
+  breakeven. `EPA_LIVE` stays False.
+- Other canonical variants (corrected grading, paired):
+  fade-10 48.95% (-0.78, z=-1.78); fade-6 47.68% (-2.02,
+  z=-2.58 -- the fade-12 live setting still wins, as before);
+  div-1.0 49.44% (-0.45, z=-1.23, still noise, div stays 0.9);
+  calibrated pick 50.16% absolute but paired -0.11
+  (z=-0.11) -- the shrunk pick does NOT beat the baseline on
+  mutually-decided games, and its coefficients were fit
+  in-sample anyway; `CALIBRATED_PICK` stays False; travel
+  (0.95 pts/1,000 mi) 50.88% absolute, paired +0.67 (z=0.97,
+  noise); off/def splits 48.52% absolute, paired -1.62
+  (z=-1.13, still worse). `TRAVEL_ENABLED` stays False.
+- Elo variants (already push-graded, re-run): default Elo
+  reproduces 52.52% / MAE 10.39 exactly (continuous margins,
+  untouched by the fix); no variant passes the promotion gate
+  (train win + test win + Bonferroni + bootstrap CI excluding
+  zero). Closest to anything are two near-zero movers
+  (rollover 0.25: paired z=0.09; HFA 110: z=0.23); the
+  nominally Bonferroni-significant one (rollover 0.75,
+  p_bonf=0.0283) is a LOSER, so it fails the gate on direction.
+  Nothing promoted.
+
+**Item 2 -- First full error-decomposition read: built, run,
+NEGATIVE result, NOTHING implemented.** Decomposition of the
+corrected baseline (via `backtest --decompose` path, verified
+to match the harness exactly: n=1,871, decided 1,795, 898 wins,
+ATS 50.03%, MAE 10.34, line MAE 9.83). Coverage: total and
+division known for all 1,871 games; wind known for 1,133,
+unknown for 738 (domes and unrecorded wind are "unknown", never
+imputed). There are no pick'em-spread games in the window
+(|line| < 0.5 never occurs), so that bucket is absent, not zero.
+
+Worst slices (qualified = decided >= 30; 51 qualified slices
+across 8 dimensions, so Bonferroni x51 applies):
+
+- By lowest ATS: NYJ picks 35.85% (19/53, MAE gap +1.32 --
+  the model's worst MAE gap too); NE picks 41.07% (23/56);
+  PHI picks 41.86% (18/43); CHI picks 43.48% (30/69); LV picks
+  43.75% (21/48). Every one is a TEAM slice with n ~50.
+  NYJ's z vs 50% is -2.06 (nominal p ~0.039) -- Bonferroni
+  x51 = 1.0. None survives correction. Team slices are also
+  the least actionable target: a Jets-only fudge fit on 53
+  games spanning 7 seasons and 3 regimes is chasing noise.
+- Worst credible (non-team) slice: short spreads (|line| in
+  [0.5, 3.5)) at 45.69% (297/650, MAE gap +0.49), z vs 50% =
+  -2.20 (nominal p ~0.028, Bonferroni x51 = 1.0). Favorite
+  picks 47.73% (305/639, z=-1.15); mid-high totals (45-50)
+  47.46% (317/668, z=-1.32); moderate wind (15-20 mph) 46.53%
+  (47/101, z=-0.70); home picks 48.76% (413/847). High wind
+  (20+ mph) is flagged small_sample (29 decided) and excluded
+  from the ranking, as designed. Divisional vs
+  non-divisional is a dead heat (50.46% vs 49.78%); early
+  weeks are not specially bad (49.19% weeks 1-4, 51.35%
+  weeks 5-9, 49.72% weeks 10+).
+- Global, not a slice: the model trails the line on MAE in
+  essentially every slice (overall gap +0.51 pts); the few
+  negative-gap slices are team slices (JAX -0.56, PIT -0.08,
+  SF -0.04, ARI -0.03). There is no slice where the model
+  beats the market on MAE to build on.
+
+Walk-forward test of targeted fixes (fit on 2019-2022 only,
+applied frozen to 2023-2025; win bar: test paired z > 1.96
+after Bonferroni across the 3 candidates, with no harm to the
+full test sample). Fix form, pre-stated: add the train slice's
+mean signed error (actual - model) to slice margins only.
+
+- NYJ bias (+2.26, fit on 35 games): test slice 38.9% ->
+  50.0%, but on TWO flips (paired 2v0, z=1.41, n=18 decided)
+  -- and the bias it was fit to REVERSED in test (train mean
+  signed +2.26, test -2.61). A team fudge that "works" via 2
+  coin-flip games while its own fitted bias flips sign is
+  not a fix. NOT implemented.
+- Short-spread bias (-0.21, fit on 367 games): test slice
+  44.1% -> 44.0%, paired 3v1 (z=1.00). The slice's problem is
+  not a level bias (train -0.21, test -0.54 -- both ~zero),
+  so there is no bias fix to apply, and shrinking toward the
+  line cannot change ATS at all (it never flips a pick).
+  NOT implemented, and no flip-the-slice rule is proposed:
+  short games are near coin flips and a contrarian rule on a
+  45.7% slice with Bonferroni p = 1.0 would be guessing.
+- Favorite-pick bias (-0.27, fit on 343 games): test slice
+  51.3% -> 48.9%, paired 2v8 (z=-1.90) -- the fix HURTS
+  out-of-sample. The train "finding" (44.34%, z=-2.05) was
+  noise that reversed (test base 51.28%). NOT implemented,
+  and this reversal is the reason slice fixes need the
+  walk-forward bar in the first place.
+
+Conclusion of item 2: no targeted fix wins walk-forward, so
+nothing model-changing was implemented. The decomposition
+module stays diagnostic-only, as designed. The honest summary
+of where the model loses is global, not sliced: it is a ~50%
+model that trails a sharp line on MAE everywhere, and its
+worst slices are small-sample team noise plus one
+moderately-sized short-spread dip with no correctable bias.
+
+**Still off by default, on purpose (this round):**
+`EPA_LIVE`, `ENSEMBLE_LIVE`, `CALIBRATED_PICK`,
+`TRAVEL_ENABLED`, `INJ_AUTO_APPLY`, `TOTALS_SRS_LIVE`,
+`STALENESS_LIVE`, `UNCERTAINTY_PICK_USE`,
+`PBP_FEATURES_LIVE` -- all False, unchanged. No flag was
+flipped, no pick logic was changed, no model parameter in
+`config.py` was changed: the grading correction is a harness
+rule, not a model parameter, and the item-2 result adds no
+parameter at all.
+
+**Files changed (local only, no GitHub push).**
+- `nflpicks/backtest.py`: corrected push rule in
+  `evaluate_variant`, `pick_margin` stored per row, new
+  `placebo_rows()` helper, docstring bridge note.
+- `nflpicks/error_decomposition.py`: `normalize_row` now
+  grades a margin == line (pick_margin if present, else
+  model_margin) as a push, matching its docstring and the
+  harness.
+- `nflpicks/pbp_features.py`: `_grade_rows` follows the
+  corrected canonical rule (was deliberately old-rule).
+- `nflpicks/pool_lines.py`: `_grade_pick` follows the
+  corrected canonical rule on both lines (was deliberately
+  old-rule).
+- `tests/test_batch3_item8.py`: the old-rule grading test
+  rewritten for the corrected rule.
+- `tests/test_batch3_items45.py`: the old-rule pool-line
+  test rewritten without a margin tie, plus a new
+  margin-equals-pool-line-is-push test.
+- `tests/test_batch4_items12.py` (new): tie-grading tests
+  (including a non-vacuous harness tie test), placebo-gate
+  tests, flags-stay-off test.
+- This README section.
+- NOT changed, deliberately: `grading.py`, `pool_results.py`,
+  `adjustment_grading.py`, `elo_variants.py`, `staleness.py`,
+  `ensemble.py`, `model.py`, `weekly_run.py`, `dashboard.py`,
+  `config.py` (no new parameters; the fix adds none).
+
+**Tests.** Full suite: 171/171 pass (164 prior + 7 new/changed
+in effect: 6 new batch-4 tests + 1 new pool-line test, with 2
+old-rule tests rewritten). `py_compile` clean on all changed
+files. Baseline before this batch: 164/164.
+
+**Limits that remain.** Recorded-line caveat unchanged: ATS
+here is against the nflverse recorded line, not a verified
+Barbara pool line, so pool ATS will differ. The games.csv
+used was re-downloaded from the nflverse URL for this run
+(same file the app fetches); the pbp files (~19 MB gz per
+season, 2017-2025) were downloaded to scratch, not committed.
+The walk-forward slice tests use a single 2019-2022 /
+2023-2025 split (the same split as the Elo gate); a different
+split could move the small NYJ numbers, which is itself a
+reason not to implement on n=18. No GitHub push was made, no
+email was sent, no current-week picks or leans are in this
+section (historical backtest data only).
+
+## Backtest batch 4 (2026-11-04, group B items 3-5) -- staleness auto-report + team HFA + dynamic blend: built, tested, NOTHING promoted
+
+Naming note: this is the parent task's Batch 4, group B, items 3-5
+only. Group A items 1-2 (tie-grading correction, canonical baseline
+now 50.03% ATS, 898/1,795, MAE 10.34) are in the section above, and
+nothing in that section was edited for this one. All runs below are
+point-in-time 2019-2025 on the same games.csv, under the corrected
+push grading, with the recorded-line caveat unchanged (ATS against
+the nflverse recorded line, not a verified Barbara pool line).
+Promotion bar throughout: a genuine walk-forward win above ~52.4%
+breakeven, surviving Bonferroni correction across the
+pre-registered tests for that item. No item clears it.
+
+**Item 3 -- Staleness auto-report: built, currently reporting
+not_enough_data, and that is the correct output.**
+`db.get_snapshot_pairs()` collects every game with both a 'pool'
+and a 'closing' snapshot in `line_snapshots`; `staleness.
+build_staleness_report()` grades follow vs fade against the pool
+line (existing `grade_staleness()`, pushes excluded) ONLY once
+completed pairs with results reach `STALENESS_MIN_COMPLETED_PAIRS`
+= 100 (config.py -- a judgment threshold, not a fitted value:
+below ~100 pairs a 50/50 split still carries a ~10 pp wide 95%
+CI, and 100 is roughly six full weeks of pool games, so one lucky
+week cannot trip it). Below threshold the report returns status
+`not_enough_data` with the counts and grades NOTHING -- no
+follow/fade percentages exist for a sub-threshold sample, so a
+handful of moved games can never be quoted as a finding.
+`staleness.auto_report(db_path, results)` is the live entry
+point: it joins snapshot pairs to a caller-supplied results map
+(results are not in this database -- picks store no result), so
+Thursday snapshots cannot inflate the pair count before games are
+played. At/above threshold the report still does NOT promote
+anything: reaching 100 makes the grading reportable, promotion
+still needs a walk-forward win above breakeven decided manually,
+and `STALENESS_LIVE` stays False. Two honesty notes carried in
+the report itself: most pairs do not move, so even at 100 pairs
+the moved-decided count may be under 30 (flagged
+small_sample_warning when it is); and the 'closing' snapshot the
+weekly run saves is the live line at run time, NOT a verified
+kickoff close, so a ready report grades pool-vs-last-live-line
+until a true close is ever recorded under that source name.
+Current live state: this checkout contains no `nfl_picks.db`, so
+a report run here returns 0 snapshot pairs -- not_enough_data,
+100 pairs still needed. No pool line was invented, no dashboard
+or weekly-run wiring was added (the report is a callable API;
+wiring a display waits for a real pair sample, as with batch 3).
+
+**Item 4 -- Team-specific HFA with shrinkage: built, tested at
+three shrinkage strengths, LOSES at all three. Flat number kept.**
+`ratings.team_home_field()` estimates each team's HFA from its
+pre-week home games only (neutral-site games excluded): raw =
+mean(actual home margin - ratings-implied margin without HFA),
+shrunk = league + (raw - league) * n/(n+K), clamped to the same
+0.5-3.0 range as the league number, teams with no home games
+getting exactly the league number. K = 25 by default
+(`TEAM_HFA_SHRINKAGE_GAMES`): a team with ~25 pre-week home games
+gets weight 0.5 on its own estimate, the honest weighting when a
+single team's home residual has SE ~13.4/sqrt(n) (batch-1 item 6
+already found team ATS-residual SD 1.44 vs mean SE 1.73 -- mostly
+noise). At a representative point (2025 week 10) the shrunk
+deviations are material, not cosmetic: mean |shrunk - league|
+0.81 pts, max 1.72, 7 of 32 teams at >= 1 pt, against a mean
+|raw - league| of 3.44 -- shrinkage is doing real work, and the
+variant still loses, so this is not a case of shrinkage hiding
+a signal. Harness variants `team_hfa` (K=25), `team_hfa_k10`,
+`team_hfa_k50` in `backtest.py` (same margin construction as
+`model.py`, home team's shrunk HFA in place of the league number,
+0 at neutral sites, 1-decimal rounding like `margin_model`):
+
+| variant | ATS% | decided | MAE | paired delta | paired z |
+|---|---|---|---|---|---|
+| baseline (flat HFA) | 50.03 | 1,795 | 10.34 | -- | -- |
+| team_hfa K=25 | 49.64 | 1,797 | 10.32 | -0.73 pp | -1.23 |
+| team_hfa_k10 | 49.33 | 1,804 | 10.33 | -0.79 pp | -1.15 |
+| team_hfa_k50 | 49.67 | 1,804 | 10.33 | -0.39 pp | -0.81 |
+
+Baseline reproduces group A exactly (50.03%, 898/1,795, MAE
+10.34), confirming the harness was not disturbed. The paired
+comparison excludes games that are pushes under either rule, so
+no tie artifact inflates these deltas, and the discordant sets
+are large (111 for K=25: 49 variant-right vs 62 base-right), so
+the negative paired z values are meaningful, not placebo-scale
+wobble -- the placebo gate, which guards tiny +/-0.15 pt
+adjustments, is not the binding check for ~0.8 pt HFA moves, and
+is not claimed as one here. Per season, K=25 wins only 2021 (+1.33 pp: 49.24 vs 47.91) and
+2023 (+1.57 pp: 48.24 vs 46.67), ties 2024 (51.50 vs 51.50), and
+loses 2019, 2020, 2022, and 2025 -- there is no consistent season
+pattern to build on, and the two wins do not offset the
+full-sample paired loss. The 0.02 pt MAE improvement (10.32 vs
+10.34) does not rescue it: the pool scores ATS, and an MAE gain
+that costs ATS points is the same trade the Elo variants already
+showed. `TEAM_HFA_LIVE` (new) stays False; nothing in `model.py`,
+`weekly_run.py`, or `dashboard.py` reads team HFA. In-sample vs
+out-of-sample, stated separately: the raw team estimates ARE
+in-sample w.r.t. the ratings they are computed against (same
+blended ratings as the pick), which is why shrinkage exists --
+but the numbers above are all walk-forward (pre-week games only),
+so the loss is an out-of-sample loss, not a fitting artifact.
+A future attempt would need a genuinely different HFA signal
+(stadium/altitude/dome splits were already null in batch 1), not
+another K.
+
+**Item 5 -- Dynamic market blend: tested three ways, NONE wins.
+Fixed blend kept -- and rescaling alone could never have won.**
+First the structural finding, proved in unit tests, not assumed:
+in this app the pick follows the SIGN of (model - line), and
+`model.py`'s blend (trust = confidence * 0.30) only rescales the
+displayed edge -- any strictly positive blend weight preserves
+the pick side exactly. A dynamic blend that only varies the
+weight by week or by deviation bucket therefore cannot change a
+single pick (except landing a margin exactly on the line, a push
+under corrected grading, not a win). The only pick-changing form
+a dynamic blend can take here is a per-bucket follow/fade flip,
+and that is what `nflpicks/dynamic_blend.py` tests walk-forward:
+learn follow/fade per bucket on 2019-2022, apply frozen to
+2023-2025. Descriptive answer to "when the model disagrees with
+the market by a lot, who wins?" -- the market, mildly, and
+consistently: full-sample model-side ATS by |deviation| is
+52.59% (<1, n=386 decided), 48.51% (1-3, n=707), 51.82% (3-5,
+n=440), 47.33% (5+, n=262; 5-8: 46.08%, n=204; 8+: 51.72%, n=58).
+The 5+ bucket loses on both splits too (train 47.89%, test
+46.67% for the model side), so fading large disagreements is not
+an obviously wrong idea -- it is just not a winning one once the
+whole slate is scored, because 5+ games are only ~14% of the
+slate and the fade gains there do not survive the games it also
+touches. Walk-forward results (test split 2023-2025, baseline
+test 49.10%, 384/782; Bonferroni across the 3 pre-registered
+tests below):
+
+- Learned deviation-bucket rule (train: follow <1, fade 1-3,
+  follow 3-5, fade 5+): test 51.92% (406/782), paired +2.81 pp,
+  z=1.07, p=0.2865, Bonferroni p=0.86 -- noise, and below 52.4%
+  breakeven. Its train in-sample paired z was only 0.56, so even
+  the training win was weak; fading the 1-3 bucket (the largest
+  bucket, 707 games) on a sub-50% train reading is not a rule to
+  trust on this evidence. Full-sample 51.98% is reported for
+  completeness only -- it re-uses the training seasons and is NOT
+  an out-of-sample result.
+- Learned week-bucket rule (train: fade weeks 1-4, follow 5-9,
+  fade 10+): test 46.68% (365/782), paired -2.43 pp, z=-0.79 --
+  a clean out-of-sample REVERSAL. Train weeks 5-9 followed at
+  58.39% and weeks 10+ faded from 47.03%; on test, weeks 5-9
+  collapse to 42.03% and weeks 10+ rise to 53.05%. A week-based
+  blend weight fit on 2019-2022 would have actively hurt
+  2023-2025. This is the single clearest no-go in the batch.
+- Pre-registered fade-if-|dev|>=5 rule: test 50.13% (392/782),
+  paired +1.02 pp, z=0.73, p=0.4652, Bonferroni p=1.0 -- noise.
+  (An abstain-on-large-deviation variant was considered and
+  rejected without testing: a pool requires a pick every game,
+  so an abstained game scores 0, strictly worse than a coin-flip
+  pick, and grading abstentions as pushes would flatter the
+  rule by deleting its losses.)
+
+`DYNAMIC_BLEND_LIVE` (new) stays False; no blend weight in
+`config.py` changes (the fixed 0.30 ceiling and confidence
+scaling are untouched), and no week- or bucket-dependent weight
+is wired into `model.py`. The placebo gate's role here is the
+rescaling proof above (positive weights cannot flip picks),
+verified in tests -- the flip rules themselves move whole
+buckets (120-575 discordant games on test), so their paired z
+values are not placebo-scale artifacts either; they are simply
+not significant.
+
+**Still off by default, on purpose (this round):**
+`STALENESS_LIVE=False` (unchanged), `TEAM_HFA_LIVE=False` (new),
+`DYNAMIC_BLEND_LIVE=False` (new), plus every flag from earlier
+batches (`EPA_LIVE`, `ENSEMBLE_LIVE`, `CALIBRATED_PICK`,
+`TRAVEL_ENABLED`, `INJ_AUTO_APPLY`, `TOTALS_SRS_LIVE`,
+`UNCERTAINTY_PICK_USE`, `PBP_FEATURES_LIVE` -- all False,
+unchanged). No flag was flipped, no pick logic was changed, no
+live model parameter in `config.py` was changed: the new
+parameters are harness/report thresholds and shadow flags only.
+
+**Files changed (local only, no GitHub push).**
+- `nflpicks/config.py`: `STALENESS_MIN_COMPLETED_PAIRS=100`,
+  `TEAM_HFA_LIVE=False` / `TEAM_HFA_SHRINKAGE_GAMES=25`,
+  `DYNAMIC_BLEND_LIVE=False` /
+  `DYNAMIC_BLEND_LARGE_DEVIATION=5.0` /
+  `DYNAMIC_BLEND_MIN_TRAIN_DECIDED=30`, each with its rationale
+  comment. No live parameter changed.
+- `nflpicks/ratings.py`: `team_home_field()` /
+  `team_home_field_detail()` (shrunk per-team HFA; harness-only).
+- `nflpicks/backtest.py`: `team_hfa` / `team_hfa_k10` /
+  `team_hfa_k50` variants (pre-week HFA estimation, league
+  fallback, neutral-site 0, 1-decimal rounding). Baseline path
+  untouched -- it reproduces 50.03% exactly.
+- `nflpicks/db.py`: `get_snapshot_pairs()` (pool+closing pairs
+  with model margin when present; results joined by caller).
+- `nflpicks/staleness.py`: `build_staleness_report()` /
+  `auto_report()` (threshold-gated grading; `grade_staleness()`
+  and flagging ownership unchanged).
+- `nflpicks/dynamic_blend.py` (new): deviation/week bucketing,
+  `blend_margin()`, `describe()`, `learn_bucket_rule()` /
+  `apply_bucket_rule()`, `fade_large_rule()` -- shadow only.
+- `tests/test_batch4_items345.py` (new): 15 tests -- threshold
+  behaviour (below/at, missing lines/results, pushes, DB-backed
+  auto-report), shrinkage math (no-home-games, neutral
+  exclusion, clamp), harness variant acceptance, blend
+  sign-preservation, bucket learning/application, paired
+  push-exclusion, flags-stay-off.
+- This README section.
+- NOT changed, deliberately: `model.py`, `weekly_run.py`,
+  `dashboard.py`, `grading.py`, `pool_lines.py`,
+  `error_decomposition.py`, `ensemble.py`, group A files, and
+  every earlier README section.
+
+**Tests.** Full suite: 186/186 pass (171 prior + 15 new).
+`py_compile` clean on all changed files. Baseline before this
+batch: 171/171.
+
+**Limits that remain.** Recorded-line caveat unchanged: items 4
+and 5 grade against the nflverse recorded line, not a verified
+Barbara pool line, so pool ATS will differ -- and item 5's
+deviation buckets are deviations from that recorded line, not
+from a pool-locked line. Item 3's true test cannot even start
+until live snapshot pairs accumulate (0 in this checkout);
+when it does, its 'closing' leg is last-live-line, not a
+verified close, unless recording changes. Item 4's team-HFA
+residuals are computed against ratings that already contain the
+played games (shrinkage mitigates, walk-forward grading
+adjudicates); a cleaner estimator would solve ratings and HFA
+jointly, but a jointly-solved variant that still loses ATS
+would not change the conclusion. Item 5 uses a single
+2019-2022 / 2023-2025 split (the same split as the Elo gate); a
+different split could move the deviation-rule test number, which
+is itself a reason not to promote on z=1.07. No GitHub push was
+made, no email was sent, no current-week picks or leans are in
+this section (historical backtest data only).
+
+## Backtest batch 4 (2026-11-04, group C items 6-7) -- play-by-play round 2 + rating uncertainty round 2: built, tested, NOTHING promoted
+
+Naming note: this is the parent task's Batch 4, group C, items
+6-7 only. Groups A (tie-grading correction, canonical baseline
+now 50.03% ATS, 898/1,795, MAE 10.34) and B (staleness
+auto-report, team HFA, dynamic blend -- nothing promoted) are
+in the sections above, and nothing in those sections was edited
+for this one. All runs below are point-in-time 2019-2025 on the
+same games.csv, under the corrected push grading, with the
+recorded-line caveat unchanged (ATS against the nflverse
+recorded line, not a verified Barbara pool line). Promotion bar
+throughout: a genuine walk-forward win above ~52.4% breakeven,
+surviving Bonferroni correction across the pre-registered
+tests for that item, with the placebo gate (below) as a floor,
+not a substitute for that bar. No item clears it.
+
+**Item 6 -- Play-by-play round 2: third-down, special-teams
+EPA, and defensive-only splits. Built, graded, NOTHING kept.**
+New module `nflpicks/pbp_round2.py` (round 1's
+`pbp_features.py` untouched). Source: the same confirmed
+source as round 1 -- nflverse-data `pbp` release,
+`play_by_play_{season}.csv.gz` (config.PBP_URL_TMPL). Files
+for 2017-2025 were used from scratch (/tmp, NOT committed);
+the 2024 file was re-downloaded fresh for this batch and
+matched the scratch copy byte-for-byte (19,362,351 bytes,
+sha256 23370d5d10f8104d80d46a1fc5e61f4f6f5a3263fe96fe2dd6
+29913cfcb08c06). One honesty note on that hash: the
+round-1 docstring's sha256 string is only 61 characters,
+so it cannot be a valid sha256 (64 required) -- the size
+match and the fresh-download match are the verification
+here, not that string, and the round-1 docstring was left
+as-is rather than silently corrected. Season row counts
+(REG): 2017: 45,268; 2018: 45,120; 2019: 45,339; 2020: 45,406;
+2021: 47,651; 2022: 47,157; 2023: 47,399; 2024: 47,274;
+2025: 46,452. No play-by-play number was invented: a season
+with no frame would grade as the SRS margin.
+
+Definitions (see the module docstring for the full text):
+third-down conversion = 3rd-down pass/run plays converting
+via first_down/touchdown flags or yards_gained >= ydstogo
+(the file's third_down_converted column is not used);
+special-teams EPA = mean `epa` per `special` == 1 play
+(kickoff, punt, field goal, extra point -- 7,216 such plays
+in 2024 REG; the narrower `special_teams_play` flag omits
+field goals and is only a fallback); defensive-only splits
+are off_diff = home_off - away_off and def_diff =
+away_allowed - home_allowed (lower allowed is better, so
+the sign flips), where round 1 only ever tested the
+combined off-minus-allowed strength and could not say
+which side drove a result. Walk-forward discipline is
+identical to round 1: season S week W rates use season-S
+weeks before W plus the full season S-1, coefficients for
+season S are fit only on scored + burn-in (2017-2018)
+rows from seasons before S, and in-sample numbers are
+reported separately below, never as the promotion test.
+
+Results, 2019-2025 (baseline 50.03% / 1,795 decided /
+MAE 10.34; feature decided counts are 1,827-1,828 because
+continuous feature margins turn baseline tie games into
+picks -- the paired comparison below is on the 1,795
+mutually-decided games, so no tie artifact inflates it;
+placebo gate re-verified fresh for this batch over 200
+seeds: paired-delta p95 +0.11 pp, absolute-ATS p95 50.22%,
+identical to group A; a feature passes the gate only if
+it clears BOTH p95s):
+
+| feature | ATS% | paired delta | paired z | discordant (var/base) | placebo gate |
+|---|---|---|---|---|---|
+| third_down | 49.56 | -0.33 pp | -1.00 | 15/21 | FAIL |
+| third_down_off | 49.56 | -0.39 pp | -0.64 | 56/63 | FAIL |
+| third_down_def | 49.84 | -0.17 pp | -0.90 | 4/7 | FAIL |
+| st_epa | 49.84 | 0.00 pp | 0.00 | 1/1 | FAIL |
+| early_down_off | 49.51 | -0.28 pp | -0.48 | 51/56 | FAIL |
+| early_down_def | 49.56 | -0.28 pp | -0.82 | 16/21 | FAIL |
+| red_zone_off | 49.84 | -0.06 pp | -0.30 | 5/6 | FAIL |
+| red_zone_def | 50.25 | +0.22 pp | +0.82 | 14/10 | pass (see below) |
+| all (third+ST+early+rz combined) | 49.84 | -0.06 pp | -0.10 | 51/52 | FAIL |
+
+MAE for every feature is 10.33-10.37 vs baseline 10.34 --
+no MAE win either (early_down_off 10.33 is the only one
+below baseline, by 0.01). Bonferroni across the 9 tested
+variants: every nominal two-sided p is >= 0.31, so every
+Bonferroni p = 1.0 -- there is no significant feature here
+at all, before breakeven is even considered.
+
+The one gate pass needs its context, because "passes the
+placebo gate" is a floor, not a promotion, and this one
+passes by less than a game: red_zone_def's absolute ATS
+(50.25%) clears the placebo p95 (50.22%) by 0.03 pp, and
+its paired delta (+0.22 pp) is 4 net games on 1,795
+mutually-decided games (14 right / 10 wrong). Most of its
+absolute gain is not mutually-decided flips at all: it
+turns 32 baseline tie games into picks and wins 20 of
+them (62.5%, n=32 -- a coin flip at that sample size).
+And it does not hold up across splits of its own
+walk-forward scored rows: 51.46% on 2019-2022 (1,030
+decided) vs 48.68% on 2023-2025 (797 decided), below the
+test-split baseline (~49.1%). A feature that passes the
+gate by 0.03 pp, fails Bonferroni (p=1.0), sits 2.15 pp
+below breakeven, and reverses on the test split is not
+promoted, and the gate flag for it is reported as a pass
+in the harness output (`passes_placebo_gate: true`) with
+this paragraph as the reason it still stays shadow. Every
+other feature fails the gate outright -- including
+special-teams EPA, whose paired z is exactly 0.00 (1
+discordant game each way) and whose fitted coefficients
+are near zero in every season (-0.34 to +0.84, against a
+natural scale near 13 for a mean-EPA-per-play feature),
+i.e. the data say ST EPA per play carries no incremental
+margin signal beyond SRS at all.
+
+What the split features DO show, and it is worth stating
+because it explains round 1: on scored rows, the
+correlation of each differential with the SRS residual
+(actual - model) is positive for every offensive split
+(early_down_off +0.062, third_down_off +0.047, st_epa
++0.019, red_zone_off +0.013) and ~zero or negative for
+every defensive split (third_down_def -0.021,
+red_zone_def -0.010, early_down_def -0.003). The fitted
+coefficients tell the same story (offensive coefficients
+positive and growing across seasons, e.g. early_down_off
+8.6 in 2019 to 20.0 in 2025; defensive coefficients mostly
+negative). The SRS margin already prices defense through
+points allowed, so a past defensive rate adds nothing
+beyond it -- and in training windows it is slightly
+anti-correlated, which is why combined features that mix
+offense and defense (round 1's early_down, red_zone)
+underperform their offensive halves. None of that rescues
+a feature: the strongest offensive correlation (+0.062)
+still grades at 49.51% walk-forward.
+
+In-sample vs out-of-sample, stated separately: fitting
+coefficients on ALL scored rows and grading those same
+rows gives third_down 49.56%, third_down_off 49.12%,
+third_down_def 50.16%, st_epa 50.49%, early_down_off
+49.89%, early_down_def 49.84%, red_zone_off 49.45%,
+red_zone_def 50.30% (in-sample coefficients: third_down
+3.79, third_down_off 10.06, third_down_def -5.47, st_epa
+1.81, early_down_off 19.21, early_down_def -0.97,
+red_zone_off 1.87, red_zone_def -1.43, early_down 11.85,
+red_zone 0.24). The in-sample numbers are no better than
+the walk-forward ones -- there is no "true" in-sample win
+being hidden by walk-forward noise here, just no signal.
+`PBP_FEATURES_LIVE` stays False; round 2 shares that flag
+(no separate live flag exists) and nothing in `model.py`,
+`weekly_run.py`, or `dashboard.py` reads `pbp_round2.py`.
+
+**Item 7 -- Rating uncertainty round 2: covariance + HFA
+uncertainty built, bands barely move, pick-logic test FAILS.
+Labels/display only, as before.**
+Batch 3's bands ignored two terms (see the batch-3
+docstring, now updated in place): rating covariance and
+HFA uncertainty. Round 2 adds both in `uncertainty.py`;
+the batch-3 functions are UNCHANGED, so old bands still
+reproduce exactly. Covariance comes from the game graph
+itself, not a fitted constant: the SRS point estimate is
+the ridge solution minimising sum_games (margin -
+(r_home - r_away))^2 / game_var + sum_teams (r -
+prior)^2 / prior_var, so the rating covariance is the
+inverse of the precision matrix P with P[t][t] =
+1/prior_var + n_t/game_var and P[t][u] = -n_tu/game_var
+(n_tu = games between t and u in the rating window,
+built point-in-time by `window_pairs()` -- season-S weeks
+before W plus the full season S-1). A direct game and
+shared opponents both enter P, so no separate
+shared/direct bookkeeping is needed. Sanity check: for
+one shared game the graph gives marginal SD 4.72 vs
+batch-3 rating_sd(1) = 4.69, and covariance positive, as
+the batch-3 docstring predicted -- the graph method
+agrees with the old formula where it should. HFA
+uncertainty is `UNCERTAINTY_HFA_SD` = 1.0 (new in
+config.py): the season mean home margin in games.csv
+2019-2025 ranges -0.14 to +2.68, SD of the seven yearly
+means 1.07 pts (the pooled SE of the overall mean, 0.33,
+would understate the drift by assuming a fixed HFA), so
+1.0 is that drift rounded -- a judgment value, not a
+fitted pick parameter. It enters margin variance as
++HFA_SD^2, and neutral-site games (34 in the window)
+pass hfa_sd=0.0 explicitly, since their HFA is 0 by
+construction. New functions: `rating_covariance_matrix()`,
+`covariance_between()`, `margin_sd_cov()`,
+`margin_interval()`, `cover_prob_interval_cov()` -- all
+labels/display, no pick path reads them.
+
+How much do the bands actually move? On all 1,871
+harness games (covariance from each game's point-in-time
+week matrix; games_home/away = current-season games
+before that week): mean graph covariance +0.67 pts^2
+(median +0.55), mean batch-3 margin SD 5.26 pts, mean
+round-2 margin SD 5.23 pts -- a net change of -0.03 pts.
+The two corrections roughly cancel (covariance narrows,
+HFA widens), and the round-2 band is narrower than batch 3
+in only 60.7% of games. By week bucket (old -> new):
+weeks 1-4, 6.48 -> 6.46; weeks 5-9, 5.36 -> 5.33;
+weeks 10+, 4.62 -> 4.57 (covariance 0.63 / 0.61 / 0.71
+respectively). That small net move is itself the finding:
+rating covariance in this league is small because each
+rating rests on many games and any one shared opponent
+contributes little -- the batch-3 bands were already
+close to honest, just slightly wide, and round 2
+quantifies "slightly" at ~0.03 pts of SD. One related
+number that must NOT be quoted as the band: the pure
+graph margin SD (graph variances + covariance + HFA)
+averages 3.54 pts -- much smaller, because the graph
+counts prior-season games as full data while batch-3
+rating_sd() treats the prior season as a 5.0-pt prior
+and recency-weights current games. The reported round-2
+band deliberately keeps batch-3 variances and adds only
+the graph covariance + HFA, so it stays comparable to
+batch 3; switching to pure graph variances would claim
+precision the recency weighting and prior fade do not
+support.
+
+Does the new band sharpen the label? Barely, and no
+better than batch 3: games whose round-2 cover interval
+straddles 0.5 (1,262 games, 67% -- the SD is ~5 pts
+against typical edges of a few points, so most games
+straddle) score 48.88% ATS on the baseline pick (1,203
+decided) vs 52.36% for non-straddling games (592
+decided); the batch-3 intervals give 48.93% vs 52.33% on
+essentially the same split. The straddle label separates
+coin flips from leans directionally, but the
+non-straddle 52.36% is still ~breakeven at n=592, and
+round 2 adds nothing to that separation over batch 3.
+
+Walk-forward pick-logic test (the test that would have
+justified flipping `UNCERTAINTY_PICK_USE`): flip the pick
+whenever the round-2 cover interval straddles 0.5, keep
+it otherwise (baseline pushes stay pushes). Result:
+51.53% ATS (925/1,795) vs baseline 50.03%, paired +1.50
+pp, paired z=0.78 (615 variant-right / 588 base-right),
+nominal p=0.44 -- noise, below 52.4% breakeven, and
+wildly season-inconsistent: +1.66 pp (2019), -1.20
+(2020), +2.28 (2021), -2.31 (2022), +8.62 (2023), -5.26
+(2024), +6.90 (2025). A rule that flips 1,232 of 1,871
+picks (every straddling game -- two-thirds of the slate)
+and then wins big in two seasons and loses big in
+another is not a pick rule, it is a near-contrarian
+slate with a noisy headline. Its MAE (10.15) is NOT
+reported as a win: the flipped "margin" in that test is
+constructed as line +/- 1, so its MAE is pulled toward
+the line (line MAE 9.83) by construction and means
+nothing about margin accuracy. `UNCERTAINTY_PICK_USE`
+therefore stays False, and the round-2 bands stay
+labels/display only, exactly like batch 3. A future
+pick-logic attempt should pre-register a rule that flips
+far fewer games (e.g. only the largest straddling edges,
+or a shrinkage rather than a flip -- noting that any
+sign-preserving shrinkage cannot change a pick at all,
+per the group B dynamic-blend proof) and test it on
+seasons after 2025, not re-search 2019-2025.
+
+**Still off by default, on purpose (this round):**
+`PBP_FEATURES_LIVE=False` (unchanged, covers round 2),
+`UNCERTAINTY_PICK_USE=False` (unchanged), plus every flag
+from earlier batches (`EPA_LIVE`, `ENSEMBLE_LIVE`,
+`CALIBRATED_PICK`, `TRAVEL_ENABLED`, `INJ_AUTO_APPLY`,
+`TOTALS_SRS_LIVE`, `STALENESS_LIVE`, `TEAM_HFA_LIVE`,
+`DYNAMIC_BLEND_LIVE` -- all False, unchanged). No flag was
+flipped, no pick logic was changed; the new parameters
+are a shadow coefficient-cap table and one HFA-SD
+judgment value only.
+
+**Files changed (local only, no GitHub push).**
+- `nflpicks/config.py`: `PBP2_COEFF_CAPS` (rate caps 100,
+  ST EPA cap 50 -- natural scale ~13, a team's ~13 ST
+  plays/game times 1 pt per EPA), `UNCERTAINTY_HFA_SD=1.0`
+  with the year-to-year-drift rationale. No live parameter
+  changed.
+- `nflpicks/pbp_round2.py` (new): third-down + ST EPA
+  weekly counts, off/def/combined differentials, clipped
+  walk-forward coefficient fits, `passes_placebo_gate()`,
+  `placebo_distribution()`, `evaluate_pbp2_features()`
+  (walk-forward + separate in-sample section). Shadow only.
+- `nflpicks/uncertainty.py`: batch-3 functions unchanged;
+  round-2 appendix -- `rating_covariance_matrix()`,
+  `covariance_between()`, `margin_sd_cov()`,
+  `margin_interval()`, `cover_prob_interval_cov()`,
+  `window_pairs()` -- plus an updated docstring section
+  explaining the two formerly-missing terms. No pick path
+  reads this module (tested).
+- `tests/test_batch4_items67.py` (new): 13 tests -- round-2
+  counts (third-down, ST EPA, POST exclusion, week-less
+  frame), differential signs, league-average fallback,
+  coefficient clipping, placebo-gate both-p95 logic, graph
+  covariance positivity/narrowing, prior-only team,
+  margin_sd_cov reproduction + HFA quadrature, interval
+  containment, window_pairs point-in-time, flags-stay-off,
+  no-pick-logic-imports.
+- This README section.
+- NOT changed, deliberately: `model.py`, `weekly_run.py`,
+  `dashboard.py`, `pbp_features.py`, `backtest.py`,
+  `calibration.py`, `ratings.py`, group A/B files, and
+  every earlier README section.
+
+**Tests.** Full suite: 199/199 pass (186 prior + 13 new).
+`py_compile` clean on all changed files. Baseline before
+this batch: 186/186.
+
+**Limits that remain.** Recorded-line caveat unchanged: both
+items grade against the nflverse recorded line, not a
+verified Barbara pool line, so pool ATS will differ. Item 6
+uses a single walk-forward scheme (coefficients fit on
+prior seasons, one 2019-2022 / 2023-2025 descriptive split
+for the red_zone_def check); a different split could move
+small numbers, which is itself a reason not to promote on
++0.22 pp. The ST EPA feature uses nflfastR's `epa` on
+special-teams plays as recorded -- kickoff/punt EPA in
+particular mixes returner and coverage effects that a
+per-unit split (kicker vs returner vs coverage) could
+separate, but that split was not built and no claim is
+made for it. Item 7's covariance ignores recency
+weighting in the graph (all window games count equally)
+and the prior-season fade, so round-2 bands are an
+approximation to the blended rating's uncertainty, not
+its exact posterior -- and the pure-graph SD (3.54) is
+reported only to warn against using it. The flip test's
+MAE is construction-artifact and is not a finding (see
+above). No GitHub push was made, no email was sent, no
+current-week picks or leans are in this section
+(historical backtest data only).
+
+## Backtest batch 4 (2026-11-04, group D, items 8-10) -- committed-DB divergence, standings import, experiment tracking
+
+Naming note: this is the parent task's Batch 4, group D, items
+8-10 only. Groups A (tie-grading correction, canonical baseline
+now 50.03% ATS, 898/1,795, MAE 10.34), B (staleness auto-report,
+team HFA, dynamic blend -- nothing promoted), and C (pbp round 2,
+uncertainty round 2 -- nothing promoted) are in the sections
+above, and nothing in those sections was edited for this one.
+No backtest numbers are re-run here: these three items are
+plumbing (which database the dashboard shows, where standings
+come from, what model produced a slate), not model variants,
+so there is no ATS% to report and no promotion question --
+the promotion question for each is whether the plumbing is
+safe to rely on, answered by the tests below. No flag was
+flipped, no pick logic was changed, no GitHub push was made,
+no email was sent, and no current-week picks or leans are in
+this section.
+
+**Item 8 -- Streamlit Cloud DB divergence: detected on load,
+resolved by an explicit sync. Built, tested, NOT live-clicked.**
+The divergence is real and has three mechanisms, all stated
+in `nflpicks/committed_db.py`: a Cloud redeploy lagging (or
+failing) after a workflow push, so the dashboard shows last
+week's slate while the repo holds the fresh one; a dashboard
+"Refresh Picks Now" writing a slate into the deployment's own
+database that the workflow can never commit back, so the
+deployment slate becomes NEWER than the committed one and the
+next redeploy silently overwrites it; and dashboard-entered
+manual adjustments / pool overrides living in the deployment
+database only (batch 3, item 5), which any sync must not
+destroy. The fix is `committed_db.py` + a dashboard banner,
+not a silent auto-overwrite (which would destroy a
+just-clicked Refresh, and which Streamlit Cloud cannot
+durably do to its own deployment database on load anyway):
+- `describe_source()` resolves the committed source from
+  env only: `PICKS_COMMITTED_DB_URL` (explicit raw URL,
+  wins), `PICKS_COMMITTED_DB_FILE` (local shared-store
+  file, no network, no token), or `PICKS_GITHUB_REPO`
+  ("owner/repo", raw.githubusercontent.com URL derived
+  from it, branch `PICKS_GITHUB_BRANCH`, default "main",
+  path in repo `nfl-picks-app/nfl_picks.db`). There is
+  deliberately NO default repo: the audit checkout has no
+  git remote to derive one from, and hardcoding a repo name
+  from memory would be inventing configuration. Until one
+  source is set, the dashboard says plainly that it reads
+  its local database only and cannot check itself -- it
+  does not pretend a check happened.
+- A token (`PICKS_GITHUB_TOKEN`) is OPTIONAL, sent only as
+  an Authorization header, never in a URL, a log, or any
+  returned dict. A public repo needs no token; a private
+  repo without one returns 401/404, which this module
+  reports as "committed source unreachable" with a local-DB
+  fallback -- it does not guess at the contents.
+- `compare_to_local()` fetches the committed DB to a temp
+  file and compares its latest slate to the local one.
+  Divergence is defined by the PICKS fingerprint (season,
+  week, matchup, pick, edge, model margin, both lines),
+  NOT by run_time: identical picks saved at different
+  seconds are the same slate to submit, and a run_time-only
+  difference must not cry divergence (this was caught by
+  a failing test during this build and fixed in the module,
+  not in the test). A newer-but-identical committed run is
+  still reported, as `committed_newer`, not hidden.
+- `sync_committed_to_local()` replaces the 13 workflow-owned
+  tables (picks, ratings snapshot, injury review/returns,
+  line snapshots, market cross-checks, model log/grades,
+  run diagnostics/diffs, survivor picks/options,
+  adjustment grades) from the snapshot, PRESERVES the 5
+  user-owned tables (manual_adjustments,
+  pool_line_overrides, survivor_used_teams, pool_results,
+  pool_standings), and MERGES run_experiments (snapshot
+  rows the local DB lacks are added; local rows are never
+  deleted). Snapshot tables absent from either side are
+  skipped, never treated as "delete everything". The sync
+  result lists replaced / skipped / preserved / merged, so
+  a lost user table would be visible in the result.
+- Dashboard: a "Data source" section on every load (when a
+  source is configured) shows match / diverged / unreachable
+  with the committed and local run times, and a diverged
+  slate gets a "Sync this dashboard to the committed
+  slate" button that runs the sync above and reruns. A
+  fetch failure warns and falls back to local, never
+  crashes the page.
+- CLI: `python -m nflpicks.committed_db [--db PATH]
+  [--sync]` prints source + comparison as JSON, never a
+  token.
+
+**Item 8 limits, honestly stated.** (1) Raw GitHub serves
+through a CDN cache: after a workflow push, a raw fetch
+can return the PREVIOUS commit's database for some
+minutes. The sync result therefore always reports the
+committed slate's run_time, and the dashboard banner says
+to check it against the expected Thursday run time instead
+of trusting the word "synced". (2) The guarantee is
+detect + explicit sync, not silent auto-sync on load, for
+the reasons above -- a Thursday-morning user who ignores
+a diverged banner and submits from the local slate is
+still submitting from the local slate. (3) Sync is
+one-way (committed -> local): dashboard-side changes that
+should reach the workflow still need the
+manual-adjustments export/commit route; this module does
+not change that. (4) Dashboard live clicking was NOT
+possible in this environment (Streamlit is not installed
+here, same as prior batches): `dashboard.py` was
+compile-checked only, and the banner/sync button needs a
+live run to confirm rendering -- the module functions it
+calls are unit-tested, the button itself is not.
+
+**Item 9 -- Standings importer: built, tested, wired into
+the dashboard's standings form.** `nflpicks/pool_standings.py`
+mirrors `pool_results.py` exactly (its own table,
+created on first use, so `db.py` is untouched; upsert on
+(season, week); last-row-wins duplicates, noted in
+errors; rejected rows never reach the DB). CSV format
+(header required; leader_name and note optional):
+
+    season,week,user_wins,leader_wins,weeks_left,leader_name,note
+    2026,10,118,120,4,,after week 9 results posted
+
+Rules that matter: `leader_wins` is the CURRENT leader's
+wins, not second place -- if the user leads, leader_wins
+== user_wins is the tied/leading input, and entering
+second place as "leader" would falsely flip the rule into
+trailing mode. `weeks_left` INCLUDES the current week
+(final week = 1), the same definition `standings.py`
+uses. Negative or non-integer wins/weeks_left reject the
+row. With no imported rows, `latest_standings()` returns
+status "empty" -- no wins, no deficit -- never 0-0 and
+never a deficit of 0, either of which would misread as
+"tied". `load_standings_file()` mirrors
+`pool_lines.load_pool_lines_file`: a missing file (or no
+`POOL_STANDINGS_CSV` path) is the empty state, not an
+error. No standings were invented: the sample CSV rows
+(118/120, 124/125) are labelled SAMPLE ONLY, and the only
+numbers in the tests are synthetic fixtures.
+`price_week_gambles(games, snapshot)` labels the week's
+defaults with `standings.suggest_gambles` on the imported
+snapshot and prices those labels with
+`simulation.compare_gambles` -- both label-only, neither
+changes a pick, and the leader is assumed to make default
+picks (the same stated limit as
+`standings.evaluate_late_window`). Dashboard wiring
+(Submit & Review tab): a CSV import expander with format,
+sample download, and upload (same pattern as the
+pool-results import), the latest snapshot pre-filling the
+standings form when one exists, and -- once labels are
+checked -- a one-week simulation pricing line for the
+form's standings (expected cost + delta P). That pricing
+is explicitly ONE-WEEK ONLY: `compare_gambles` over this
+week's games alone reports P(ahead after this week), NOT
+season-end P(first). Full-season pricing still needs cover
+probabilities for the whole remaining schedule, which this
+database does not store (the batch-3 standings-wiring
+limit, unchanged); presenting the one-week number as a
+season-end number would be a misstatement, and the module
+docstring, the function note, and the dashboard text all
+carry the caveat with the numbers. What is deliberately
+NOT built: a per-entrant field table -- standings.py and
+simulation.py model a single leader, and a field model
+would be a different module, not a reinterpretation of
+these rows.
+
+**Item 10 -- Experiment tracking on every weekly run:
+built, tested, wired into weekly_run and reporting.**
+`nflpicks/experiment.py` owns its own table
+(`run_experiments`, created on first use, `db.py`
+untouched), one row per weekly run: model version label,
+git head (best-effort `git rev-parse --short HEAD`, 5s
+timeout, None when git metadata is unavailable -- in
+Streamlit Cloud that is normal, not an error, and is
+never invented), the full flag set, the blend/rating
+parameters, a fingerprint, and the slate's picks count.
+The version label (`PICKS_MODEL_VERSION` when set, else
+"nfl-picks-app (unlabelled build)") is cosmetic and the
+module says so: the attribution key is the fingerprint,
+sha256 (first 16 hex) of the canonical JSON of flags +
+params, so any flag or parameter change changes the
+fingerprint and identical fingerprints mean identical
+recorded settings. Flags recorded (all eleven
+off-by-default flags, read from `config.py` AT CALL TIME
+so a patched config records what was actually used; a
+flag missing from config records as None, unknown, never
+as False): EPA_LIVE, ENSEMBLE_LIVE, CALIBRATED_PICK,
+TRAVEL_ENABLED, INJ_AUTO_APPLY, TOTALS_SRS_LIVE,
+STALENESS_LIVE, UNCERTAINTY_PICK_USE, PBP_FEATURES_LIVE,
+TEAM_HFA_LIVE, DYNAMIC_BLEND_LIVE. Parameters recorded:
+PRIOR_FADE_GAMES, PRIOR_REGRESSION, DIV_MULTIPLIER,
+MARKET_TRUST_COMPLEMENT, COVER_SHRINK_SLOPE,
+COVER_SHRINK_INTERCEPT, EPA_POINTS_PER_UNIT, EPA_BLEND,
+SRS_DAMPING, ELO_K. Wiring: `weekly_run.py` calls
+`experiment.record_run()` once per run, AFTER picks are
+saved, inside try/except with a diagnostic -- a tracking
+failure never fails a run whose picks are already saved,
+exactly like the what-changed diff. It is NOT called from
+grading (a separate workflow step re-reading the same DB):
+a second row per week would double-count the same slate.
+Reporting: the dashboard's Model Grades tab shows the
+latest experiment row for the season/week (fingerprint,
+version label, git head, run time, picks count, flags
+live that week, full parameter list), with "no record"
+reported as unknown, never guessed; `attribution_for_week()`
+joins any caller-computed grading to that row (status
+"unknown" for pre-batch weeks, with the grading returned
+un-attributed); and `python -m nflpicks.experiment
+[--db PATH] [--season N] [--week N]` prints the season's
+experiment timeline as JSON. `grading.py` itself is
+unchanged -- attribution is a join on top of grading, not
+a change to grading -- and the table is append-only
+history (PRIMARY KEY run_time + season + week; a re-run
+in the same second overwrites its own row, which is the
+same run), merged -- never wiped -- by a committed-DB
+sync, for the same reason.
+
+**Still off by default, on purpose (this round):** all
+eleven flags above are False (verified by test, not just
+asserted in prose), plus every flag from earlier batches.
+No flag was flipped, no pick logic was changed; the new
+config values are env-driven source settings, a standings
+CSV path, and a version-label env var only.
+
+**Files changed (local only, no GitHub push).**
+- `nflpicks/committed_db.py` (new): source resolution,
+  fetch (optional token header only), slate fingerprint +
+  comparison, workflow-table sync with user-table
+  preservation and run_experiments merge, CLI.
+- `nflpicks/pool_standings.py` (new): standings CSV parse
+  / upsert / latest / clear, one-week gamble pricing with
+  the one-week caveat, file loader, CLI, sample CSV.
+- `nflpicks/experiment.py` (new): settings capture +
+  fingerprint, run recording, latest/timeline/attribution,
+  CLI.
+- `nflpicks/config.py`: `COMMITTED_DB_*` (URL / file /
+  repo / branch / in-repo path / timeout / 64 MB cap, all
+  env-driven, no default repo), `POOL_STANDINGS_CSV_PATH`,
+  `EXPERIMENT_MODEL_VERSION`. No live parameter changed.
+- `weekly_run.py`: one `experiment.record_run()` call
+  after `save_picks`, try/except + diagnostic, nothing
+  else changed.
+- `dashboard.py`: committed-DB banner + sync button (top
+  of page), standings CSV import + pre-filled form +
+  one-week pricing (Submit & Review tab), experiment
+  record display (Model Grades tab). Compile-checked
+  only -- see item 8 limits.
+- `tests/test_batch4_items8910.py` (new): 16 tests --
+  committed source modes (local / repo URL / bad repo
+  rejected without network), file-mode match + diverge,
+  unreachable fallback, sync replaces workflow tables and
+  preserves user tables, standings parse/reject/duplicate,
+  empty state, save/load/latest, one-week pricing uses the
+  actual snapshot and its caveat, early mode has no
+  gambles, all 11 flags off, record/latest/fingerprint
+  change on a flag flip, capture determinism, weekly_run
+  and dashboard wiring by source inspection,
+  no-flag-flipped in the new modules.
+- This README section.
+- NOT changed, deliberately: `db.py`, `grading.py`,
+  `model.py`, `standings.py`, `simulation.py`,
+  `pool_results.py`, `pool_lines.py`, `freshness.py`,
+  `.github/workflows/weekly.yml`, and every earlier README
+  section. In particular the workflow does NOT gain a
+  committed-DB step: the check lives in the dashboard,
+  where the divergence is visible, and the workflow's
+  commit step is untouched.
+
+**Tests.** Full suite: 215/215 pass (199 prior + 16 new).
+`py_compile` clean on all changed files (including
+`dashboard.py` and the new test file). CLI smoke checks
+(no network, temp DB only): `experiment --season 2026
+--week 10` prints the recorded fingerprint
+(`d709a1eb4a8b148a` for the all-flags-off settings in
+that smoke run -- a fingerprint of that run's settings,
+not a canonical value to compare against, since any
+config change changes it); `pool_standings --sample`
+prints the sample CSV; `committed_db` with no source
+configured prints status `local_only` and no token.
+Baseline before this batch: 199/199.
+
+**Limits that remain.** Dashboard live clicking was not
+possible here (Streamlit not installed): the banner, the
+sync button, the standings import UI, the pre-filled form,
+the one-week pricing line, and the experiment display all
+need a live run to confirm rendering -- only their
+underlying module functions are unit-tested. The
+committed-DB check does nothing at all until a source is
+configured in the deployment's environment (Streamlit
+Cloud secrets/env): with no source, Thursday morning
+still shows the local slate with only a caption saying
+so. The one-week simulation pricing is not season-end
+pricing (see item 9 caveat, repeated wherever the number
+appears). Experiment rows exist only for runs after this
+batch: a bad week from before it cannot be attributed to
+a recorded change, and `attribution_for_week` says
+"unknown" for those weeks rather than reconstructing one.
+No GitHub push was made, no email was sent, no
+current-week picks or leans are in this section.

@@ -241,6 +241,105 @@ def bootstrap_ci(values: list[str], trials: int | None = None,
             "decided": n}
 
 
+def build_staleness_report(rows: list[dict], threshold: int | None = None) -> dict:
+    """The staleness auto-report (batch 4, group B item 3).
+
+    Input rows are grade_staleness() rows (pool_line, closing_line,
+    actual_margin, optional season and model_margin) for COMPLETED
+    games only -- a game with no result yet is not a pair and must
+    not be passed in. A row counts toward the threshold only when it
+    has both lines and a result (grade_staleness's `skipped` rows do
+    not count). The report "fires" -- i.e. contains a follow/fade
+    grading -- only once n_completed_pairs reaches `threshold`
+    (default config.STALENESS_MIN_COMPLETED_PAIRS = 100, a judgment
+    threshold documented in config.py, not a fitted value). Below
+    that it returns status "not_enough_data" with the counts and
+    grades NOTHING: no follow/fade percentages are computed from a
+    sub-threshold sample, so a half-dozen moved games can never be
+    quoted as a staleness finding. At/above threshold the report is
+    the grade_staleness() output plus the threshold accounting and an
+    explicit non-promotion note: reaching the threshold makes the
+    grading reportable, it does NOT promote any staleness score --
+    promotion still needs a walk-forward win above ~52.4% breakeven
+    with multiple-comparison correction, and STALENESS_LIVE stays
+    False until that bar is met by a manual decision. Snapshot
+    caveat (see config.py): the 'closing' line in live snapshots is
+    the live line at run time, not a verified kickoff close, so a
+    ready report grades pool-vs-last-live-line, and says so."""
+    if threshold is None:
+        threshold = int(getattr(config, "STALENESS_MIN_COMPLETED_PAIRS", 100))
+    usable = []
+    for r in rows:
+        try:
+            float(r["pool_line"]); float(r["closing_line"]); float(r["actual_margin"])
+            usable.append(r)
+        except (KeyError, TypeError, ValueError):
+            continue
+    n_pairs = len(usable)
+    base = {"status": None, "threshold": int(threshold),
+            "n_completed_pairs": n_pairs,
+            "pairs_needed": max(0, int(threshold) - n_pairs),
+            "snapshot_note": ("'closing' snapshots are the live line at "
+                              "weekly-run time, not a verified kickoff close, "
+                              "unless a true close is recorded under that source name.")}
+    if n_pairs < int(threshold):
+        base["status"] = "not_enough_data"
+        base["note"] = ("Not enough completed pool+closing pairs to grade "
+                        "staleness yet -- no follow/fade numbers are reported "
+                        "for a sub-threshold sample, and no staleness score "
+                        "is promoted. STALENESS_LIVE stays False.")
+        return base
+    graded = grade_staleness(usable)
+    base["status"] = "ready"
+    base.update(graded)
+    moved_decided = (graded["follow"]["decided"] or 0)
+    base["n_moved_decided"] = moved_decided
+    base["note"] = ("Threshold met: follow/fade below are graded against "
+                    "the pool line on completed pairs. Reaching the "
+                    "threshold does NOT promote a staleness score -- "
+                    "promotion needs a walk-forward win above ~52.4% "
+                    "breakeven with correction, decided manually. "
+                    "STALENESS_LIVE stays False.")
+    if moved_decided < 30:
+        base["small_sample_warning"] = (
+            "Fewer than 30 moved decided games: follow/fade splits on "
+            "this sample are still noisy even though the pair threshold "
+            "is met (most pairs do not move) -- do not act on them.")
+    return base
+
+
+def auto_report(db_path: str | None = None, results: dict | None = None,
+                threshold: int | None = None) -> dict:
+    """Build the auto-report from a live database (batch 4, group B
+    item 3). `results` maps (season, week, home_team, away_team) to
+    the actual home margin for completed games; pairs with no result
+    in that mapping are uncompleted and excluded from the count, so
+    a Thursday snapshot cannot inflate the pair total before the
+    games are played. Returns build_staleness_report() output, plus
+    n_snapshot_pairs (all pairs in the DB, completed or not) so the
+    gap between snapshots saved and games completed is visible.
+    Nothing here writes to the database or changes a pick."""
+    from . import db as db_mod
+
+    pairs = db_mod.get_snapshot_pairs(db_path)
+    results = results or {}
+    rows = []
+    for p in pairs:
+        key = (p["season"], p["week"], p["home_team"], p["away_team"])
+        if key not in results or results[key] is None:
+            continue
+        try:
+            actual = float(results[key])
+        except (TypeError, ValueError):
+            continue
+        rows.append({"pool_line": p["pool_line"], "closing_line": p["closing_line"],
+                     "actual_margin": actual, "season": p["season"],
+                     "model_margin": p["model_margin"]})
+    report = build_staleness_report(rows, threshold=threshold)
+    report["n_snapshot_pairs"] = len(pairs)
+    return report
+
+
 def paired_z(b_correct: int, v_correct: int, both_n: int) -> dict:
     """McNemar-style paired z for two rules on the same decided games:
     b = games baseline right / variant wrong, v = variant right /

@@ -351,25 +351,28 @@ def adjusted_margin(model_margin: float, diffs: dict, coeffs: dict) -> float:
 
 def _grade_rows(rows: list[dict], margin_key: str) -> list[dict]:
     """Re-grade rows on the margin in `margin_key` with the
-    CANONICAL harness rule (backtest.evaluate_variant), NOT the
-    batch-2 _ats_rows rule: actual > line -> correct iff margin
-    > line; actual < line -> correct iff margin < line;
-    actual == line -> push. A margin exactly equal to the line
-    is therefore a WRONG pick when the game is decided, which
-    is what makes these numbers comparable to the canonical
-    49.12% baseline instead of the batch-2 internal 50.03%."""
+    CANONICAL harness rule (backtest.evaluate_variant) as corrected
+    in batch 4: margin == line or actual == line -> push (no pick);
+    otherwise actual > line -> correct iff margin > line, actual <
+    line -> correct iff margin < line. Before batch 4 this function
+    deliberately used the old canonical rule (margin == line counted
+    wrong when decided) so its numbers matched the old 49.12%
+    baseline; after the correction the old rule no longer exists
+    anywhere in the harness, and this function follows the corrected
+    rule -- the batch-3 pbp numbers (baseline 49.12%, red-zone
+    paired z=4.02) are superseded, see the README Batch 4 bridge."""
     out = []
     for r in rows:
         m = r.get(margin_key)
         if m is None:
             continue
         line, actual = float(r["spread_line"]), float(r["actual_margin"])
-        if actual > line:
-            ats = "correct" if m > line else "wrong"
-        elif actual < line:
-            ats = "correct" if m < line else "wrong"
-        else:
+        if m == line or actual == line:
             ats = "push"
+        elif actual > line:
+            ats = "correct" if m > line else "wrong"
+        else:
+            ats = "correct" if m < line else "wrong"
         out.append({
             "season": r["season"], "week": r["week"],
             "home_team": r["home_team"], "away_team": r["away_team"],
@@ -422,7 +425,8 @@ def evaluate_pbp_features(games: pd.DataFrame, seasons: list[int],
     # caught in the first run of this evaluation, where 2019
     # came out identical to baseline for exactly that reason).
     # The REPORTED baseline below is still evaluated seasons
-    # only, so the canonical 49.12% number is unchanged.
+    # only, so the reported baseline is the corrected canonical
+    # number (batch 4: 50.03%, not the old 49.12%).
     baseline_full = backtest_mod.evaluate_variant(games, ordered, "baseline")
     base_rows = baseline_full["_games"].to_dict("records")
     srs_by_key = {(r["season"], r["week"], r["home_team"], r["away_team"]): r

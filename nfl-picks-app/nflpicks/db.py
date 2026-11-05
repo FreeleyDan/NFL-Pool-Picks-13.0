@@ -340,6 +340,40 @@ def get_line_moves(season: int, week: int, db_path: str | None = None,
     return sorted(out, key=lambda d: -d["movement"])
 
 
+def get_snapshot_pairs(db_path: str | None = None) -> list[dict]:
+    """All pool+closing snapshot pairs (batch 4, group B item 3).
+
+    One row per game that has BOTH a 'pool' and a 'closing' snapshot
+    in line_snapshots (the weekly run saves pool when a pool override
+    is set and closing whenever a live line exists). The model's
+    pre-game margin is joined from picks when present, else None --
+    a pair counts for the staleness report even without a model
+    margin, since follow/fade need only the two lines and a result.
+    Results are NOT in this database (picks store no result), so the
+    caller joins actual margins from the schedule/results source
+    before grading; see staleness.auto_report(). Sorted by season,
+    week, home team for stable reporting."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT pool.season AS season, pool.week AS week, "
+            "pool.home_team AS home_team, pool.away_team AS away_team, "
+            "pool.line AS pool_line, close.line AS closing_line, "
+            "p.model_independent AS model_margin "
+            "FROM line_snapshots pool "
+            "JOIN line_snapshots close ON close.season=pool.season AND close.week=pool.week "
+            "  AND close.home_team=pool.home_team AND close.away_team=pool.away_team "
+            "  AND close.source='closing' "
+            "LEFT JOIN picks p ON p.season=pool.season AND p.week=pool.week "
+            "  AND p.home_team=pool.home_team AND p.away_team=pool.away_team "
+            "WHERE pool.source='pool' "
+            "ORDER BY pool.season, pool.week, pool.home_team, pool.away_team",
+        ).fetchall()
+    return [{"season": r["season"], "week": r["week"],
+             "home_team": r["home_team"], "away_team": r["away_team"],
+             "pool_line": r["pool_line"], "closing_line": r["closing_line"],
+             "model_margin": r["model_margin"]} for r in rows]
+
+
 def save_market_crosscheck(season: int, week: int, home_team: str, away_team: str,
                            crosscheck_result: dict, db_path: str | None = None):
     """Persist one market cross-check (batch 2, item 6). Flags are

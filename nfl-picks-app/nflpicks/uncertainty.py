@@ -47,16 +47,47 @@ The model, stated so it can be checked rather than trusted:
     With the defaults: 0 games -> 5.00, 4 games -> ~3.9,
     12 games -> ~3.2, 17 games -> ~3.1.
 
-What is deliberately left out, and the direction of the error:
+What was deliberately left out in batch 3, and is added in
+batch 4 group C item 7 (functions at the end of this module;
+the batch-3 functions above are UNCHANGED, so old tests and
+old bands still reproduce exactly):
   * Home-field uncertainty: the margin adds HFA as a constant.
     Ignoring its error understates margin variance slightly.
+    Round 2 adds it as +UNCERTAINTY_HFA_SD^2 (1.0 pt, the
+    year-to-year SD of season home-margin means 2019-2025,
+    1.07 rounded -- see config.py), so a neutral-site game,
+    where HFA is 0 by construction, should pass hfa_sd=0.0
+    explicitly rather than taking the default.
   * Covariance between the two teams' ratings: SRS solves all
     teams jointly from shared games, so rating errors are not
     independent. Ignoring positive correlation OVERSTATES the
     margin variance (Var(a-b) < Var(a)+Var(b) when a,b are
-    positively correlated). The two omissions push in opposite
-    directions; the covariance one is the larger effect, so the
-    margin bands here are best read as wide, not tight.
+    positively correlated). Round 2 computes that covariance
+    from the game graph itself (rating_covariance_matrix):
+    the SRS point estimate is the ridge solution to
+    minimising sum_games (margin - (r_home - r_away))^2 /
+    game_var + sum_teams (r - prior)^2 / prior_var, so the
+    posterior covariance of the ratings is the inverse of
+    the precision matrix P with P[t][t] = 1/prior_var +
+    n_t/game_var and P[t][u] = -n_tu/game_var (n_tu = games
+    between t and u in the rating window). A direct game
+    between the pair AND shared opponents both enter P, so
+    no separate shared/direct bookkeeping is needed and no
+    correlation constant is fitted to picks. The diagonal
+    of that inverse is close to rating_sd()^2 (it differs
+    only by the coupling -- e.g. one shared game gives a
+    marginal SD of 4.72 vs rating_sd(1) = 4.69), which is a
+    check that the graph method agrees with the batch-3
+    formula where it should. The two round-2 corrections
+    push in opposite directions (covariance narrows the
+    margin band, HFA widens it); at mid-season the net is
+    a slightly narrower band than batch 3, which is the
+    honest direction, not a claim of extra precision.
+    The graph method ignores recency weighting (all games
+    in the window count equally) and the prior-season fade,
+    so its SDs are an approximation to the blended rating's
+    uncertainty, not its exact posterior -- the same honesty
+    caveat as batch 3, now with both known terms included.
   * The blended rating's own fade weight (w = n/12 in
     ratings.blended_team_ratings) is NOT reused here: that fade
     is a point-estimate shrinkage rule, while this is a
@@ -198,3 +229,188 @@ def summarize_team(rating: float, games_played: int) -> dict:
                  "weighting (see uncertainty.py), not a promise "
                  "that the true rating lies inside it."),
     }
+
+
+# ---------------------------------------------------------------------------
+# Batch 4 group C, item 7 -- round 2: covariance + HFA uncertainty.
+# Batch-3 functions above are unchanged. Everything below is
+# labels/display only: config.UNCERTAINTY_PICK_USE stays False
+# and no pick logic imports this module (see test_batch3_items67).
+# ---------------------------------------------------------------------------
+
+def _hfa_sd() -> float:
+    return float(getattr(config, "UNCERTAINTY_HFA_SD", 1.0))
+
+
+def _invert_matrix(mat: list[list[float]]) -> list[list[float]] | None:
+    """Gauss-Jordan inverse with partial pivoting (stdlib only;
+    the matrix is at most 32x32 for an NFL season). Returns None
+    if the matrix is singular to working precision, so callers
+    fall back to the independent formula instead of crashing."""
+    n = len(mat)
+    if n == 0:
+        return []
+    aug = [list(map(float, mat[i])) + [1.0 if j == i else 0.0 for j in range(n)]
+           for i in range(n)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[piv][col]) < 1e-12:
+            return None
+        aug[col], aug[piv] = aug[piv], aug[col]
+        div = aug[col][col]
+        aug[col] = [v / div for v in aug[col]]
+        for r in range(n):
+            if r != col and aug[r][col] != 0.0:
+                factor = aug[r][col]
+                aug[r] = [v - factor * w for v, w in zip(aug[r], aug[col])]
+    return [row[n:] for row in aug]
+
+
+def rating_covariance_matrix(teams: list[str],
+                             game_pairs: list[tuple[str, str]],
+                             prior_sd: float | None = None,
+                             game_sd: float | None = None) -> dict:
+    """Posterior covariance of team ratings from a game graph.
+
+    teams: node list (order defines the matrix rows/cols).
+    game_pairs: (home, away) for every game in the rating window
+    -- point-in-time discipline is the CALLER's job (season S
+    weeks before W plus the full season S-1, as in
+    window_pairs() below); a pair listed twice counts twice.
+    Returns {"teams": teams, "cov": matrix, "var": {team: var},
+    "sd": {team: sd}} where cov[i][j] is Cov(r_i, r_j) in pts^2.
+    A team with no games gets exactly prior_var and zero
+    covariance with every other team (its row/col is the prior
+    alone, since P has no off-diagonal entries for it).
+    If the precision matrix is singular (cannot happen with a
+    positive prior precision, but guarded anyway), cov is None
+    and callers fall back to rating_sd() / covariance 0.
+    """
+    if prior_sd is None:
+        prior_sd = _prior_sd()
+    if game_sd is None:
+        game_sd = _game_sd()
+    prior_var = float(prior_sd) ** 2
+    game_var = float(game_sd) ** 2
+    idx = {t: i for i, t in enumerate(teams)}
+    n = len(teams)
+    prec = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        prec[i][i] = 1.0 / prior_var
+    for home, away in game_pairs:
+        if home not in idx or away not in idx or home == away:
+            continue
+        ih, ia = idx[home], idx[away]
+        prec[ih][ih] += 1.0 / game_var
+        prec[ia][ia] += 1.0 / game_var
+        prec[ih][ia] -= 1.0 / game_var
+        prec[ia][ih] -= 1.0 / game_var
+    cov = _invert_matrix(prec)
+    if cov is None:
+        return {"teams": list(teams), "cov": None, "var": {}, "sd": {}}
+    return {"teams": list(teams), "cov": cov,
+            "var": {t: cov[idx[t]][idx[t]] for t in teams},
+            "sd": {t: math.sqrt(max(cov[idx[t]][idx[t]], 0.0)) for t in teams}}
+
+
+def covariance_between(cov_result: dict, team_a: str, team_b: str) -> float:
+    """Cov(r_a, r_b) from a rating_covariance_matrix() result;
+    0.0 if either team is absent or the matrix is None (the
+    independent fallback -- a missing team is prior-only, and
+    a prior-only rating is uncorrelated with everything else)."""
+    cov = cov_result.get("cov")
+    teams = cov_result.get("teams", [])
+    if cov is None or team_a not in teams or team_b not in teams:
+        return 0.0
+    idx = {t: i for i, t in enumerate(teams)}
+    return float(cov[idx[team_a]][idx[team_b]])
+
+
+def margin_sd_cov(games_home: int, games_away: int, covariance: float = 0.0,
+                  hfa_sd: float | None = None) -> float:
+    """Margin SD with both round-2 terms: sqrt(sd_h^2 + sd_a^2
+    - 2*covariance + hfa_sd^2). With covariance=0 and
+    hfa_sd=0 this reproduces margin_sd() exactly; with the
+    defaults (covariance as computed from the graph, hfa_sd =
+    config.UNCERTAINTY_HFA_SD) it is the honest band. The
+    max(..., 0.0) guard only fires for an impossible covariance
+    (cov > (var_h + var_a + hfa^2)/2, e.g. a caller-supplied
+    value from a different scale) -- a graph covariance can
+    never trip it, since the inverse precision matrix is
+    positive definite. Pass hfa_sd=0.0 for neutral-site games.
+    """
+    if hfa_sd is None:
+        hfa_sd = _hfa_sd()
+    var = (rating_sd(games_home) ** 2 + rating_sd(games_away) ** 2
+           - 2.0 * float(covariance) + float(hfa_sd) ** 2)
+    return math.sqrt(max(var, 0.0))
+
+
+def margin_interval(model_margin: float, games_home: int, games_away: int,
+                    covariance: float = 0.0, hfa_sd: float | None = None,
+                    z: float | None = None) -> tuple[float, float]:
+    """Two-sided margin band: model_margin +/- z * margin_sd_cov.
+    Default z is config.UNCERTAINTY_Z90 (1.645). This is a band
+    for the RATING-implied margin, not for the actual game
+    margin (which also carries ~13.43 pts of game noise) -- it
+    answers "could rating error alone move this margin across
+    the line?", which is the Thursday-review question. Rounded
+    to 1 decimal, matching rating display."""
+    if z is None:
+        z = float(getattr(config, "UNCERTAINTY_Z90", 1.645))
+    sd = margin_sd_cov(games_home, games_away, covariance, hfa_sd)
+    return (round(float(model_margin) - z * sd, 1),
+            round(float(model_margin) + z * sd, 1))
+
+
+def cover_prob_interval_cov(model_margin: float, line: float,
+                            games_home: int, games_away: int,
+                            covariance: float = 0.0,
+                            hfa_sd: float | None = None) -> tuple[float, float]:
+    """cover_prob_interval() with the round-2 margin SD: the
+    calibrated point probability mapped through the same
+    empirical CDF at the shrunk margin shifted by +/-1
+    margin_sd_cov. Same endpoint-swap logic as the batch-3
+    function (the away side's interval inverts), same
+    guarantees (contains the point probability, lo <= hi).
+    A range straddling 0.5 means rating uncertainty alone
+    (covariance + HFA included) is enough to flip which side
+    is favoured: treat that pick as a coin flip, whatever the
+    point estimate says. Label only -- it never changes a pick.
+    """
+    sd = margin_sd_cov(games_home, games_away, covariance, hfa_sd)
+    home_hi = calibration.cover_probability_home(float(model_margin) + sd, float(line))
+    home_lo = calibration.cover_probability_home(float(model_margin) - sd, float(line))
+    if float(model_margin) >= float(line):
+        lo, hi = home_lo, home_hi
+    else:
+        lo, hi = round(1.0 - home_hi, 3), round(1.0 - home_lo, 3)
+    return (min(lo, hi), max(lo, hi))
+
+
+def window_pairs(games, season: int, week: int) -> list[tuple[str, str]]:
+    """(home, away) pairs in the rating window for season/week:
+    season-S games with week < W plus the FULL season S-1.
+    games is a backtest.load_games_frame-style frame (columns
+    season/week/home_team/away_team, REG rows only when a
+    game_type column is present). Point-in-time by
+    construction: no game from week W or later enters, so a
+    covariance computed from this window cannot leak the
+    game being predicted. Returns [] for a frame without the
+    needed columns, rather than guessing."""
+    if games is None or getattr(games, "empty", True):
+        return []
+    needed = ("season", "week", "home_team", "away_team")
+    if not all(c in games.columns for c in needed):
+        return []
+    df = games
+    if "game_type" in df.columns:
+        df = df[df["game_type"].astype(str).str.upper() == "REG"]
+    cur = df[(df["season"] == season) & (df["week"] < week)]
+    prior = df[df["season"] == season - 1]
+    # itertuples() field access uses the column names; both
+    # frames share them, so the two lists concatenate directly.
+    return ([(str(r.home_team), str(r.away_team))
+             for r in cur.itertuples(index=False)]
+            + [(str(r.home_team), str(r.away_team))
+               for r in prior.itertuples(index=False)])

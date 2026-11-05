@@ -16,7 +16,7 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 
-from nflpicks import config, data, ratings, injuries, epa, model, survivor, db, scoring, manual_adjustments, run_diff
+from nflpicks import config, data, ratings, injuries, epa, model, survivor, db, scoring, manual_adjustments, run_diff, experiment
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("weekly_run")
@@ -394,6 +394,22 @@ def _run():
         totals_off=totals_off, totals_def=totals_def, totals_league_avg=totals_league_avg,
     )
     db.save_picks(config.SEASON, predictions)
+    # Experiment tracking (batch 4, group D, item 10): log this
+    # run's model version + flag set + blend/params + fingerprint
+    # into run_experiments, so a later grade can be attributed to
+    # a specific model change. Never fails the run: tracking is
+    # bookkeeping, and picks are already saved at this point.
+    try:
+        _exp = experiment.record_run(config.SEASON, week, picks_count=len(predictions))
+        data._record("Experiment tracking", True,
+                     f"Recorded run fingerprint {_exp['fingerprint']} "
+                     f"(version label {_exp['model_version']!r}, git {_exp['git_head'] or 'unknown'}).")
+        log.info("Experiment recorded: %s", _exp["fingerprint"])
+    except Exception as exc:
+        log.warning("Experiment tracking failed (picks already saved, continuing): %s", exc)
+        data._record("Experiment tracking", False,
+                     f"Could not record this run's model settings ({exc}) -- this week's grade "
+                     "cannot be attributed to a recorded model change.")
     # Line snapshots (item 7): pool line when set, closing/live line
     # always when present. The dashboard's line-moves section compares
     # these; a move never auto-switches the pool line.

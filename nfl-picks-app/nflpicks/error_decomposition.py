@@ -23,11 +23,21 @@ What this module is NOT:
   "unknown" bucket, and the report states how many games are unknown
   per dimension. Unknown is a coverage fact, not a zero.
 * It does NOT re-grade with a different push rule. A margin exactly
-  equal to the line is a push (batch-2 convention), excluded from
-  ATS% but counted, matching backtest._ats_rows and staleness.py.
-  Canonical evaluate_variant rows already carry "ats"; this module
-  re-derives it from pick/line/actual when normalizing, so a caller
-  passing raw picks gets the same rule.
+  equal to the line is a push (batch-2 convention, and the
+  canonical rule since batch 4), excluded from ATS% but counted,
+  matching backtest._ats_rows, backtest.evaluate_variant, and
+  staleness.py. Canonical evaluate_variant rows already carry
+  "ats"; this module re-derives it from pick/line/actual when
+  normalizing, so a caller passing raw picks gets the same rule.
+  Batch 4 fixed a gap here: normalize_row previously checked only
+  actual == line, so a backtest row whose MODEL margin equalled
+  the line was re-graded correct/wrong from its bookkeeping side
+  while the harness graded it push. The tie check now uses the
+  row's pick_margin when present (the margin the pick was graded
+  on, e.g. the shrunk margin for calibrated_pick), else
+  model_margin. Side/team slices still count push rows in n (the
+  bookkeeping side) but never in decided -- same as
+  backtest.summarize.
 
 Row contract (normalized dicts, see normalize_backtest_rows /
 normalize_pick_rows):
@@ -211,7 +221,16 @@ def normalize_row(row: dict) -> dict | None:
         model_f = float(model_margin) if model_margin is not None else None
     except (TypeError, ValueError):
         model_f = None
-    if actual_f == line_f:
+    # Batch 4: a no-lean margin (pick_margin when present, else
+    # model_margin) exactly equal to the line is a push, not a
+    # correct/wrong pick from the bookkeeping side. Without this,
+    # backtest rows the harness grades push were re-graded here.
+    pick_m = row.get("pick_margin")
+    try:
+        tie_margin = float(pick_m) if pick_m is not None else model_f
+    except (TypeError, ValueError):
+        tie_margin = model_f
+    if actual_f == line_f or (tie_margin is not None and tie_margin == line_f):
         ats = "push"
     else:
         home_covers = actual_f > line_f

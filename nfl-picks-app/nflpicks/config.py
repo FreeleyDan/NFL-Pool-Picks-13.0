@@ -464,6 +464,22 @@ UNCERTAINTY_PRIOR_SD = 5.0
 UNCERTAINTY_GAME_MARGIN_SD = 13.43
 UNCERTAINTY_Z90 = 1.645  # 90% band multiplier for rating_interval()
 UNCERTAINTY_PICK_USE = False
+# ---- Batch 4 (2026-11-04, group C item 7): rating uncertainty round 2 ----
+# UNCERTAINTY_PICK_USE stays False: the walk-forward flip test in the
+# README batch-4 group C section did NOT win, so no pick logic reads
+# the new covariance/HFA-aware bands either. The new functions in
+# uncertainty.py are labels/display only, like the batch-3 bands.
+# UNCERTAINTY_HFA_SD: the league HFA is not a known constant -- the
+# season mean home margin in games.csv 2019-2025 ranges -0.14 to
+# +2.68, SD of the seven yearly means 1.07 pts (pooled SE of the
+# overall mean is only 0.33, which would understate the drift by
+# assuming a fixed HFA). 1.0 is that drift rounded, a judgment
+# value, not a fitted pick parameter: it enters margin variance
+# as +HFA_SD^2, i.e. ~+0.07 pts on a ~4.5 pt margin SD at mid-season.
+# Covariance needs no new constant: it comes from the game graph
+# itself (uncertainty.rating_covariance_matrix), using the same
+# prior/game SDs above, so there is nothing to fit to picks.
+UNCERTAINTY_HFA_SD = 1.0
 # Item 6: run_diff.py reporting thresholds (points). A pick flip is
 # always reported regardless of edge size; everything else must move
 # at least this far to earn a row, so rounding wobbles do not flood
@@ -472,6 +488,53 @@ RUN_DIFF_MIN_EDGE_MOVE = 0.5
 RUN_DIFF_MIN_RATING_MOVE = 0.5
 RUN_DIFF_MIN_LINE_MOVE = 0.5
 RUN_DIFF_MIN_TOTAL_MOVE = 0.5
+
+# ---- Batch 4 (2026-11-04, group B items 3-5): staleness auto-report / team HFA / dynamic blend ----
+# Item 3: STALENESS_LIVE stays False. The auto-report (staleness.py)
+# fires -- i.e. produces a follow/fade grading -- only once
+# STALENESS_MIN_COMPLETED_PAIRS completed pool+closing snapshot pairs
+# with results have accumulated in db.line_snapshots. 100 is a
+# judgment threshold, not a fitted value: below ~100 pairs a
+# follow/fade split is dominated by noise (a 50/50 split on 100
+# decided games still has a ~10 pp wide 95% CI), and 100 is roughly
+# six full weeks of pool games, so it cannot be reached by one lucky
+# week. Until then the report states not_enough_data explicitly and
+# grades nothing. Note the snapshot caveat: weekly_run.py saves the
+# 'closing' snapshot from the live line at run time, NOT a verified
+# kickoff close, so pairs are pool-vs-last-live-line until a true
+# close is ever recorded under that source name.
+STALENESS_MIN_COMPLETED_PAIRS = 100
+# Item 4: TEAM_HFA_LIVE stays False -- no team-specific HFA is wired
+# into model.py, weekly_run.py, or dashboard.py. The harness variant
+# team_hfa (ratings.team_home_field) is the only consumer. Shrinkage:
+# a team's shrunk HFA = league + (raw_team - league) * n/(n+K), where
+# n is that team's pre-week home games in the played history and K is
+# below. K=25 means a team with a full season-plus of home games
+# (~25) gets weight 0.5 on its own estimate -- the prior (league mean)
+# and the team's own data count equally at that sample size, which is
+# the honest weighting when a single team's home residual has SE
+# ~13.4/sqrt(n) points (batch-1 item 6: team ATS-residual SD 1.44 vs
+# mean SE 1.73 -- mostly noise). Shrunk values are clamped to the
+# same HFA_MIN/HFA_MAX range as the league number, and neutral-site
+# games still get 0.
+TEAM_HFA_LIVE = False
+TEAM_HFA_SHRINKAGE_GAMES = 25
+# Item 5: DYNAMIC_BLEND_LIVE stays False -- no dynamic blend is wired
+# into model.py. The finding that forces this: in this app the pick
+# follows the SIGN of (model - line), and any strictly positive blend
+# weight preserves that sign, so rescaling the blend by week or by
+# deviation bucket cannot change a single pick (except a margin
+# landing exactly on the line, i.e. a tie artifact). The only
+# pick-changing dynamic rule is a per-bucket follow/fade flip, which
+# dynamic_blend.py tests walk-forward and which did NOT win (see
+# README batch-4 group B). Thresholds below are the test's
+# definitions, not live parameters: LARGE_DEVIATION is the "model
+# disagrees a lot" bucket edge, MIN_TRAIN_DECIDED is the floor below
+# which a bucket's training record defaults to follow (do not flip
+# a bucket on a handful of games).
+DYNAMIC_BLEND_LIVE = False
+DYNAMIC_BLEND_LARGE_DEVIATION = 5.0
+DYNAMIC_BLEND_MIN_TRAIN_DECIDED = 30
 
 # ---- Survivor pool ----
 # NFL win probability from a point spread, via a logistic curve fit to
@@ -541,4 +604,48 @@ PBP_COEFF_CAPS = {"early_down": 100.0, "red_zone": 100.0}
 PBP_EARLY_DOWN_THRESHOLDS = {1: 0.4, 2: 0.6}
 # Red zone = plays starting at yardline_100 <= 20.
 PBP_RED_ZONE_YARDLINE = 20.0
+
+# ---- Batch 4 (2026-11-04, group D items 8-10) ----
+# Item 8: committed-DB source (committed_db.py). ALL optional and
+# all env-driven; there is deliberately NO default repo name --
+# the audit checkout has no git remote to derive one from, and
+# hardcoding one from memory would be inventing configuration.
+# Until one source is set, the dashboard reads its local DB
+# only and says so (mode "local"). A token is optional, sent
+# only as an Authorization header, never in a URL or a log.
+COMMITTED_DB_URL = os.environ.get("PICKS_COMMITTED_DB_URL", "")
+COMMITTED_DB_FILE = os.environ.get("PICKS_COMMITTED_DB_FILE", "")
+COMMITTED_DB_REPO = os.environ.get("PICKS_GITHUB_REPO", "")
+COMMITTED_DB_BRANCH = os.environ.get("PICKS_GITHUB_BRANCH", "main")
+COMMITTED_DB_PATH_IN_REPO = "nfl-picks-app/nfl_picks.db"
+COMMITTED_DB_TIMEOUT_SECONDS = 30
+COMMITTED_DB_MAX_BYTES = 64 * 1024 * 1024
+# Item 9: standings CSV path (pool_standings.py), mirroring
+# POOL_LINES_CSV_PATH. Empty = no standings file supplied, and
+# pool_standings reports that empty state, never invented wins.
+POOL_STANDINGS_CSV_PATH = os.environ.get("POOL_STANDINGS_CSV", "")
+# Item 10: experiment tracking (experiment.py). The version
+# label is cosmetic -- the fingerprint of flags+params is the
+# attribution key. Empty label env = "nfl-picks-app (unlabelled
+# build)" in the record, never a guessed release number.
+EXPERIMENT_MODEL_VERSION = os.environ.get("PICKS_MODEL_VERSION", "")
+
+# ---- Batch 4 (2026-11-04, group C item 6): play-by-play round 2 ----
+# Round 2 shares PBP_FEATURES_LIVE (False, above): nothing in
+# model.py, weekly_run.py, or dashboard.py reads pbp_round2.py
+# either, and no separate live flag exists to flip. Coefficient
+# caps (points per unit differential, same clipping role as
+# PBP_COEFF_CAPS): rate features (0-1 scale) cap 100, as in
+# round 1. ST EPA is a mean EPA per play, not a rate: a team
+# averages ~13 special-teams plays per game, so a 1-pt-per-EPA
+# translation implies a natural coefficient near 13; cap 50
+# allows ~4x that and only stops a tiny-denominator fit from
+# producing an absurd value. The "early_down"/"red_zone"
+# combined keys here are the round-1 combined differentials,
+# reused only for the round-2 "all" variant.
+PBP2_COEFF_CAPS = {"third_down": 100.0, "third_down_off": 100.0,
+                   "third_down_def": 100.0, "st_epa": 50.0,
+                   "early_down": 100.0, "early_down_off": 100.0,
+                   "early_down_def": 100.0, "red_zone": 100.0,
+                   "red_zone_off": 100.0, "red_zone_def": 100.0}
 

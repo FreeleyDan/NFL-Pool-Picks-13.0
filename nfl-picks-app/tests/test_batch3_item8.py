@@ -183,15 +183,17 @@ class TestPbpFittingAndGrading(unittest.TestCase):
             pf.adjusted_margin(3.0, {"early_down": 0.2, "red_zone": None},
                                {"early_down": 10.0, "red_zone": 10.0}), 5.0)
 
-    def test_canonical_grading_rule_not_batch2_push_rule(self):
+    def test_corrected_grading_rule_margin_equals_line_is_push(self):
+        # Batch 4: the old canonical rule (margin == line with a
+        # decided game counted WRONG) was the bug; the corrected
+        # canonical rule grades it a push, matching batch-2
+        # _ats_rows. Actual == line is also a push.
         rows = [{"season": 2024, "week": 1, "home_team": "KC", "away_team": "DEN",
                  "spread_line": 3.0, "actual_margin": 7.0, "feat_margin": 3.0},
                 {"season": 2024, "week": 1, "home_team": "BUF", "away_team": "MIA",
                  "spread_line": 3.0, "actual_margin": 3.0, "feat_margin": 10.0}]
-        # Margin == line with a decided game is WRONG (canonical),
-        # not a push (batch-2 _ats_rows rule); actual == line is a push.
         graded = pf._grade_rows(rows, "feat_margin")
-        self.assertEqual(graded[0]["ats"], "wrong")
+        self.assertEqual(graded[0]["ats"], "push")
         self.assertEqual(graded[1]["ats"], "push")
 
     def test_loader_reads_local_file_subset(self):

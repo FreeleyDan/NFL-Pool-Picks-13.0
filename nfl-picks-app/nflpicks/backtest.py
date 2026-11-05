@@ -24,6 +24,16 @@ Design, and why it is trustworthy where the old grading was not:
   Results therefore differ slightly from those scripts (baseline
   ~47.7-48.0% depending on HFA choice) -- the harness number is the
   canonical one going forward, because it mirrors the live run.
+* BATCH 4 grading correction (2026-11-04): a pick margin exactly
+  equal to the line is graded a PUSH (no pick), not a wrong pick.
+  The old rule produced the canonical 49.12% baseline (898/1,828
+  decided, 2019-2025); the corrected baseline is 50.03%
+  (898/1,795 decided, MAE unchanged at 10.34). The 33 decided
+  tie-margin games are the entire difference -- same wins, fewer
+  decided games. Old numbers are preserved in the README Batch 4
+  bridge, not rewritten. Every variant graded through
+  evaluate_variant (including calibrated_pick, whose pick is the
+  shrunk margin) uses the corrected rule.
 * Variants are applied by temporarily patching config values
   (PRIOR_FADE_GAMES, RECENT_HALF_LIFE_GAMES, DIV_MULTIPLIER,
   CALIBRATED_PICK, TRAVEL_ENABLED) or by supplying an
@@ -75,6 +85,16 @@ VARIANTS: dict[str, dict] = {
     # epa_ratings_fn must return SOS-iterative EPA ratings
     # (epa.sos_epa_ratings, blended) rather than naive ones. Batch 2.
     "epa_sos": {},
+    # team_hfa (batch 4, group B item 4): baseline ratings, but the
+    # target-week margin uses the home team's SHRUNK per-team HFA
+    # (ratings.team_home_field, from pre-week games only) instead of
+    # the league number; neutral-site games still get 0. The k10/k50
+    # entries only change the shrinkage constant K via config patch
+    # (read at call time by team_home_field), so the branch below
+    # keys on the variant name prefix, not on an override value.
+    "team_hfa": {},
+    "team_hfa_k10": {"TEAM_HFA_SHRINKAGE_GAMES": 10},
+    "team_hfa_k50": {"TEAM_HFA_SHRINKAGE_GAMES": 50},
 }
 
 
@@ -185,9 +205,19 @@ def evaluate_variant(games: pd.DataFrame, seasons: list[int], variant: str = "ba
                     # for stability; the target week itself is excluded
                     # because played_current stops before it.
                     ratings_for_week = None
+                    team_hfa = None
                 else:
                     hfa = ratings_mod.compute_empirical_hfa(played_current, prior_games)
                     ratings_for_week, games_played = ratings_mod.blended_team_ratings(played_current, prior_games, hfa)
+                    # Batch 4 group B item 4: per-team HFA is estimated
+                    # from pre-week games ONLY (played_current stops
+                    # before the target week; prior_games is the full
+                    # prior season), against the same blended ratings
+                    # used for the pick -- see ratings.team_home_field
+                    # for why shrinkage is essential on that basis.
+                    team_hfa = (ratings_mod.team_home_field(
+                        played_current, prior_games, ratings_for_week, hfa)
+                        if variant.startswith("team_hfa") else None)
                 targets = season_games[(season_games["week"] == week) & season_games["result"].notna()
                                        & season_games["spread_line"].notna()]
                 for _, row in targets.iterrows():
@@ -200,6 +230,22 @@ def evaluate_variant(games: pd.DataFrame, seasons: list[int], variant: str = "ba
                         rest_adj = model_mod._rest_adjustment(row.get("home_rest"), row.get("away_rest"))
                         div_mult = getattr(config, "DIV_MULTIPLIER", 1.0) if model_mod._is_div_game(row.get("div_game")) else 1.0
                         model_margin = (model_margin + rest_adj) * div_mult
+                    elif team_hfa is not None:
+                        # Same margin construction as model.py, with
+                        # the home team's shrunk HFA in place of the
+                        # league number (league fallback for teams
+                        # missing from the dict; 0 at neutral sites).
+                        home, away = row["home_team"], row["away_team"]
+                        eff_hfa = 0.0 if str(row.get("location") or "").strip().lower() == "neutral" \
+                            else team_hfa.get(home, hfa)
+                        rest_adj = model_mod._rest_adjustment(row.get("home_rest"), row.get("away_rest"))
+                        div_mult = getattr(config, "DIV_MULTIPLIER", 1.0) if model_mod._is_div_game(row.get("div_game")) else 1.0
+                        # Rounded to 1 decimal like model.py's
+                        # margin_model, so the variant is comparable
+                        # to the baseline rather than differing on
+                        # sub-0.1 precision.
+                        model_margin = round((ratings_for_week.get(home, 0.0) - ratings_for_week.get(away, 0.0)
+                                              + eff_hfa + rest_adj) * div_mult, 1)
                     else:
                         epa_ratings = epa_ratings_fn(season, week, games_played) if epa_ratings_fn else None
                         pred = model_mod.predict_game(
@@ -219,17 +265,43 @@ def evaluate_variant(games: pd.DataFrame, seasons: list[int], variant: str = "ba
                     # variant a no-op in the first harness run (0 flips).
                     pick_margin = (calibration.shrunk_margin(model_margin)
                                    if variant == "calibrated_pick" else model_margin)
-                    if actual > line:
-                        ats = "correct" if pick_margin > line else "wrong"
-                    elif actual < line:
-                        ats = "correct" if pick_margin < line else "wrong"
-                    else:
+                    # BATCH 4 (2026-11-04) grading correction: a pick margin
+                    # exactly equal to the line is NO PICK (push), not a
+                    # wrong pick. The old rule counted it wrong whenever
+                    # the game was decided, because it can never be > or
+                    # < the line -- 34 baseline margins land exactly on
+                    # the line in 2019-2025 (33 decided), so the old
+                    # canonical baseline (49.12%, 898/1,828) understated
+                    # the model by exactly those 33 games. The corrected
+                    # baseline is 50.03% (898/1,795) with MAE unchanged
+                    # (10.34); see the README Batch 4 bridge, which
+                    # keeps the old numbers on record instead of
+                    # rewriting them. This now matches the batch-2
+                    # _ats_rows rule, elo_variants._grade, and
+                    # error_decomposition.normalize_row. pick_side /
+                    # pick_favdog below still use the >line convention
+                    # (a tie records as the away side) for bucketing
+                    # only; the pick itself is the push, and ATS%
+                    # excludes it.
+                    if pick_margin == line or actual == line:
                         ats = "push"
+                    elif actual > line:
+                        ats = "correct" if pick_margin > line else "wrong"
+                    else:
+                        ats = "correct" if pick_margin < line else "wrong"
                     edge = model_margin - line
                     rows.append({
                         "season": int(season), "week": int(week),
                         "home_team": row["home_team"], "away_team": row["away_team"],
-                        "model_margin": round(model_margin, 3), "spread_line": line,
+                        "model_margin": round(model_margin, 3),
+                        # pick_margin is the margin the pick is actually
+                        # graded on: the shrunk margin for
+                        # calibrated_pick, the raw margin otherwise.
+                        # Batch 4: error_decomposition uses it (when
+                        # present) for its margin==line push check, so
+                        # a shrunk-margin tie is not re-graded wrong
+                        # there from the raw margin.
+                        "pick_margin": round(pick_margin, 3), "spread_line": line,
                         "actual_margin": actual, "edge": round(edge, 3),
                         "edge_bucket": ("0-1" if abs(edge) < 1 else "1-3" if abs(edge) < 3 else
                                         "3-5" if abs(edge) < 5 else "5-8" if abs(edge) < 8 else "8+"),
@@ -591,6 +663,53 @@ def evaluate_ensemble_and_features(games: pd.DataFrame, seasons: list[int],
     }
     out["_rows"] = scored_rows
     return out
+
+
+def placebo_rows(baseline_games: pd.DataFrame, seed: int, magnitude: float = 0.15) -> pd.DataFrame:
+    """Placebo gate for tiny adjustments (batch 4).
+
+    Re-grades the baseline's own margins with a random +/-magnitude
+    adjustment per game (no data at all) under the corrected push
+    rule. A real tiny feature must beat THIS, not just the baseline:
+    under the old grading rule a placebo scored 50.33% ATS with
+    paired z=3.77, purely by breaking exact ties that the old rule
+    counted wrong -- a headline better than the red-zone feature it
+    was meant to check. Under corrected grading the placebo's
+    paired delta vs baseline is ~0 (its only moves are games whose
+    |edge| < magnitude, plus tie games it turns from pushes into
+    ~coin-flip picks), so a feature that cannot beat the placebo
+    distribution has no signal. Deterministic for a given seed.
+    Input: an evaluate_variant _games frame (or any frame with
+    model_margin / spread_line / actual_margin / season / week /
+    home_team / away_team). Output: a summarize()-compatible frame
+    graded on the adjusted margin."""
+    import random
+
+    rng = random.Random(seed)
+    rows: list[dict] = []
+    for r in baseline_games.to_dict("records"):
+        line, actual = float(r["spread_line"]), float(r["actual_margin"])
+        m = float(r["model_margin"]) + rng.choice((-magnitude, magnitude))
+        if m == line or actual == line:
+            ats = "push"
+        elif actual > line:
+            ats = "correct" if m > line else "wrong"
+        else:
+            ats = "correct" if m < line else "wrong"
+        rows.append({
+            "season": r["season"], "week": r["week"],
+            "home_team": r["home_team"], "away_team": r["away_team"],
+            "model_margin": round(m, 3), "spread_line": line,
+            "actual_margin": actual, "edge": round(m - line, 3),
+            "edge_bucket": ("0-1" if abs(m - line) < 1 else "1-3" if abs(m - line) < 3 else
+                            "3-5" if abs(m - line) < 5 else "5-8" if abs(m - line) < 8 else "8+"),
+            "pick_side": "home" if m > line else "away",
+            "pick_favdog": ("fav" if (line > 0 and m > line) or (line < 0 and m < line) else "dog"),
+            "week_bucket": r.get("week_bucket", "1-4" if r["week"] <= 4 else "5-9" if r["week"] <= 9 else "10+"),
+            "ats": ats, "abs_err": abs(actual - m),
+            "line_abs_err": abs(actual - line),
+        })
+    return pd.DataFrame(rows)
 
 
 def paired_comparison(baseline_games: pd.DataFrame, variant_games: pd.DataFrame) -> dict:

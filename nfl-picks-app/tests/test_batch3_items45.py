@@ -105,22 +105,41 @@ class TestPoolLinesGrading(unittest.TestCase):
         self.assertEqual(out["per_season"]["2024"]["pool"]["wins"], 3)
 
     def test_pool_line_harder_delta(self):
-        # Same picks, pool line uniformly 1 pt worse for the model:
-        # recorded 2-0 becomes pool 1-1, delta -50 pp on this tiny sample.
-        rows = [_brow(2024, 1, "KC", "DEN", 4.0, 3.0, 3.5),
-                _brow(2024, 1, "DAL", "PHI", 4.0, 3.0, 3.5)]
+        # Same picks, pool line 1 pt worse for the model: recorded
+        # 2-0 becomes pool 0-2, delta -100 pp on this tiny sample.
+        # Batch 4 note: the old version of this test used a pool
+        # line exactly equal to the model margin (4.0), which the
+        # old rule graded as an away pick (wrong); the corrected
+        # rule grades that a push, so the numbers now use a pool
+        # line strictly between the actual margin and the model
+        # margin instead -- same lesson, no tie involved.
+        rows = [_brow(2024, 1, "KC", "DEN", 5.0, 3.5, 4.0),
+                _brow(2024, 1, "DAL", "PHI", 5.0, 3.5, 4.0)]
         pool_rows = [
             {"season": 2024, "week": 1, "away_team": "DEN", "home_team": "KC",
-             "pool_spread": 4.0, "pool_total": None},
+             "pool_spread": 4.5, "pool_total": None},
             {"season": 2024, "week": 1, "away_team": "PHI", "home_team": "DAL",
-             "pool_spread": 4.0, "pool_total": None},
+             "pool_spread": 4.5, "pool_total": None},
         ]
         out = pl.grade_pool_lines(rows, pool_rows)
-        # actual 3.5 < pool 4.0 -> home pick wrong on both; recorded
-        # 3.5 > 3.0 -> correct on both. So recorded 2-0, pool 0-2.
+        # Recorded: model 5.0 > 3.5 -> home pick, actual 4.0 > 3.5
+        # -> home covers, correct. Pool: model 5.0 > 4.5 -> home
+        # pick, actual 4.0 < 4.5 -> away covers, wrong.
         self.assertEqual(out["recorded"]["record"], "2-0")
         self.assertEqual(out["pool"]["record"], "0-2")
         self.assertEqual(out["delta_pp"], -100.0)
+
+    def test_pool_line_margin_equals_line_is_push(self):
+        # Batch 4: a model margin exactly equal to the pool line is
+        # a push against that line (and a pick against the recorded
+        # line, where it differs) -- not an away pick.
+        rows = [_brow(2024, 1, "KC", "DEN", 4.0, 3.0, 3.5)]
+        pool_rows = [{"season": 2024, "week": 1, "away_team": "DEN", "home_team": "KC",
+                      "pool_spread": 4.0, "pool_total": None}]
+        out = pl.grade_pool_lines(rows, pool_rows)
+        self.assertEqual(out["recorded"]["record"], "1-0")
+        self.assertEqual(out["pool"]["pushes"], 1)
+        self.assertEqual(out["pool"]["decided"], 0)
 
     def test_push_and_unmatched_handling(self):
         rows = [_brow(2024, 1, "KC", "DEN", 4.0, 3.0, 3.0),  # actual == recorded -> push
