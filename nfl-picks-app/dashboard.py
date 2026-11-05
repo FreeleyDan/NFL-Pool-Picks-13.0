@@ -3,12 +3,13 @@ Run locally with:  streamlit run dashboard.py
 Deploy free at:     https://share.streamlit.io  (point it at this repo)
 """
 import json
+import os
 import traceback
 
 import pandas as pd
 import streamlit as st
 
-from nflpicks import adjustment_grading, committed_db, config, db, error_decomposition, experiment, freshness, grading, manual_adjustments, pool_results, pool_standings, review_queue, run_diff, standings, submission, uncertainty
+from nflpicks import adjustment_grading, committed_db, config, db, error_decomposition, explain, experiment, freshness, grading, manual_adjustments, pool_results, pool_standings, review_queue, run_diff, sensitivity, standings, submission, uncertainty
 import weekly_run
 
 st.set_page_config(page_title="NFL Pool Picks", layout="wide")
@@ -88,6 +89,20 @@ elif _fresh["level"] == "warn":
         st.warning("Failed step(s) on the last run: " + "; ".join(
             f"{s['step']}: {s['detail']}" for s in _fresh["failed_steps"]))
 
+# ---- Streamlit Secrets bridge (batch 5, group C, item 7) ----
+# Streamlit Cloud has no plain env-var UI: values set in App
+# Settings -> Secrets arrive as st.secrets, not os.environ.
+# Bridge the known committed-DB keys once on load so a
+# Secrets-configured PICKS_GITHUB_REPO / PICKS_GITHUB_TOKEN
+# reaches committed_db.describe_source() below. Best-effort: no
+# Secrets configured (or an older Streamlit) leaves the
+# environment untouched, and an already-set env var always wins
+# over a Secret of the same name.
+try:
+    committed_db.apply_streamlit_secrets(st.secrets)
+except Exception:
+    pass
+
 # ---- Committed-DB check (batch 4, group D, item 8) ----
 # The workflow commits nfl_picks.db to the repo every run; this
 # deployment reads its own local copy, which can diverge (a
@@ -103,17 +118,35 @@ elif _fresh["level"] == "warn":
 try:
     _src = committed_db.describe_source()
     if _src["mode"] == "local":
+        # Batch 5, group C, item 7: the unconfigured state names
+        # exactly what is missing and what to set, instead of a
+        # generic "local only" note. Full steps + verification are
+        # in committed_db.setup_instructions() and the README
+        # batch-5 group C item-7 section. The token is created by
+        # the user in GitHub Settings -- it is never in code.
         st.caption("Data source: this deployment's local database only. "
                    "No committed-DB source is configured, so this page cannot "
                    "check itself against the workflow-committed slate -- a "
                    "lagged redeploy or a dashboard Refresh could leave it "
-                   "diverged. Set PICKS_COMMITTED_DB_URL, "
-                   "PICKS_COMMITTED_DB_FILE, or PICKS_GITHUB_REPO (plus "
-                   "PICKS_GITHUB_TOKEN for a private repo) to enable the check.")
+                   "diverged. To turn the check on, set PICKS_GITHUB_REPO "
+                   "(\"owner/repo\", copied from your repo's GitHub URL) and, "
+                   "for a private repo, PICKS_GITHUB_TOKEN (a token with "
+                   "read-only access to that repo's contents, created in "
+                   "GitHub Settings -> Developer settings -> Personal access "
+                   "tokens). In Streamlit Cloud both go in App Settings -> "
+                   "Secrets (there is no plain env-var UI there); locally, "
+                   "export them in the shell before running the dashboard. "
+                   "Verify: reload -- this note is replaced by a match note "
+                   "or a divergence warning with a Sync button.")
     else:
         _cmp = committed_db.compare_to_local()
         if _cmp["status"] == "unreachable":
             st.warning("⚠️ Committed-DB check failed: " + _cmp["note"])
+            if _src.get("mode") == "repo" and not os.environ.get("PICKS_GITHUB_TOKEN"):
+                st.caption("For a private repo this fails without PICKS_GITHUB_TOKEN -- "
+                           "a missing token looks identical to a missing file, by design. "
+                           "Set it in App Settings -> Secrets (see the setup note above) "
+                           "and reload.")
         elif _cmp["status"] == "diverged":
             st.warning("⚠️ " + _cmp["note"])
             st.caption(f"Committed run: {_cmp['committed']['run_time']} "
@@ -190,6 +223,18 @@ with tab_ats:
         return ""
 
     wk_df["flag"] = wk_df.apply(_flag, axis=1)
+    # Line moves (pool vs live) per game, computed once here for
+    # the Why column below and reused by the review section
+    # further down the tab: signed closing - pool, nflverse
+    # convention. Only games with a >=1 pt move or an edge flip
+    # are returned (see db.get_line_moves); the rest have no
+    # move worth mentioning in the explanation.
+    try:
+        _moves = db.get_line_moves(config.SEASON, latest_week)
+    except Exception:
+        _moves = []
+    _line_move_by_game = {(m["home_team"], m["away_team"]): round(m["closing_line"] - m["pool_line"], 2)
+                          for m in _moves}
     # All spreads in this table stay in nflverse convention
     # (+ = home favored) so Vegas, Pool, and Model columns are
     # directly comparable. The pool-line FORM below is the exception:
@@ -210,33 +255,59 @@ with tab_ats:
     # best-effort: any missing input skips it rather than breaking
     # the picks table.
     _cover_range = None
+    _cover_range_tuples = {}
     try:
         _wk_ratings = ratings_df[ratings_df["week"] == latest_week] if not ratings_df.empty else ratings_df
         _games_played = {r.team: int(r.games_played_this_season)
                          for r in _wk_ratings.itertuples()
                          if "games_played_this_season" in _wk_ratings.columns}
         if _games_played and "model_independent" in wk_df.columns:
-            def _range_for(row):
-                _line = row["pool_spread"] if pd.notna(row.get("pool_spread")) else row.get("vegas_spread")
-                if pd.isna(row.get("model_independent")) or _line is None or pd.isna(_line):
-                    return ""
+            for _r in wk_df.itertuples():
+                _line = _r.pool_spread if pd.notna(getattr(_r, "pool_spread", None)) else getattr(_r, "vegas_spread", None)
+                if pd.isna(getattr(_r, "model_independent", None)) or _line is None or pd.isna(_line):
+                    continue
                 _lo, _hi = uncertainty.cover_prob_interval(
-                    float(row["model_independent"]), float(_line),
-                    _games_played.get(row["home_team"], 0),
-                    _games_played.get(row["away_team"], 0))
-                return f"{_lo:.2f}-{_hi:.2f}"
-            _cover_range = wk_df.apply(_range_for, axis=1)
+                    float(_r.model_independent), float(_line),
+                    _games_played.get(_r.home_team, 0),
+                    _games_played.get(_r.away_team, 0))
+                _cover_range_tuples[(_r.home_team, _r.away_team)] = (_lo, _hi)
+            if _cover_range_tuples:
+                _cover_range = wk_df.apply(
+                    lambda row: (f"{_cover_range_tuples[(row['home_team'], row['away_team'])][0]:.2f}-"
+                                 f"{_cover_range_tuples[(row['home_team'], row['away_team'])][1]:.2f}"
+                                 if (row["home_team"], row["away_team"]) in _cover_range_tuples else ""),
+                    axis=1)
     except Exception:
         _cover_range = None
+        _cover_range_tuples = {}
     if _cover_range is not None:
         wk_df["cover_prob_range"] = _cover_range
         show_cols.insert(show_cols.index("cover_prob") + 1 if "cover_prob" in show_cols else 10,
                          "cover_prob_range")
+    # Items 8 + 9 (batch 5, group C): one-line "why" and flip
+    # sensitivity per game, from the numbers already in this table
+    # (rating edge, market disagreement, injury flag, line move,
+    # uncertainty band). Best-effort: any failure leaves the
+    # columns blank rather than breaking the picks table, and
+    # neither function can change a pick, an edge, or a line.
+    try:
+        _explain_rows = []
+        for _rec in wk_df.to_dict("records"):
+            _rec = dict(_rec)
+            _rec["line_move"] = _line_move_by_game.get((_rec.get("home_team"), _rec.get("away_team")))
+            _rec["cover_prob_range"] = _cover_range_tuples.get((_rec.get("home_team"), _rec.get("away_team")))
+            _explain_rows.append(_rec)
+        wk_df["why"] = [e["why"] for e in explain.explain_picks(_explain_rows)]
+        wk_df["flips"] = [s["summary"] for s in sensitivity.sensitivities_for_games(_explain_rows)]
+    except Exception:
+        wk_df["why"] = ""
+        wk_df["flips"] = ""
+    show_cols = show_cols + ["why", "flips"]
     show = wk_df[show_cols]
     show.columns = ["Away", "Home", "Vegas Spread", "Pool Spread", "Model Spread (raw)", "Model Spread (official)",
                      "Edge", "Pick", "Confidence", "Flag"] + (["Cover Prob"] if "cover_prob" in wk_df.columns else []) + (["Cover Prob Range"] if "cover_prob_range" in show_cols else []) + [
                      "Injury Flags",
-                     "Vegas Total", "Pool Total", "Model Total", "Total Pick", "Weather"]
+                     "Vegas Total", "Pool Total", "Model Total", "Total Pick", "Weather", "Why", "What flips it"]
     st.dataframe(show, use_container_width=True, hide_index=True)
     st.caption(
         "\"Model Spread (raw)\" is the rating engine's independent read, before it's blended toward the "
@@ -258,21 +329,25 @@ with tab_ats:
         "rating uncertainty (item 7): a range straddling 0.50 means the "
         "rating bands alone could flip the favoured side, so treat the "
         "pick as a coin flip even if the point probability looks strong. "
-        "Bands are model uncertainty, not a guarantee."
+        "Bands are model uncertainty, not a guarantee. "
+        "\"Why\" is the same numbers in one plain-English line per game "
+        "(rating edge, market disagreement, injury flag, line move, "
+        "uncertainty band -- labels only, nothing in it changes a pick). "
+        "\"What flips it\" is the line move or rating change that would "
+        "flip the pick: \"fragile\" means the next half-point move flips it, "
+        "\"real lean\" means it takes a 3-point move, \"thin lean\" is in "
+        "between. A fragile pick is not a wrong pick, but it is one a "
+        "Thursday line move can take away from you."
     )
 
     # Line-movement review (backtest item 7, added 2026-11-04): games
     # where the pool line and the closing/live line moved >=1 pt or the
-    # model edge flips between them. This is a manual Thursday-morning
+    # model edge flips between them. _moves was computed above for the
+    # Why column; this section reuses it. This is a manual Thursday-morning
     # check only -- the pool line is NEVER auto-switched, since it is
     # what the pool is judged against. Snapshots are written by
     # weekly_run.py (pool) and by picks saves (closing); until both
     # exist for a week this section is simply empty, not an error.
-    try:
-        from nflpicks import db as _db
-        _moves = _db.get_line_moves(config.SEASON, latest_week)
-    except Exception:
-        _moves = []
     if _moves:
         st.divider()
         st.markdown("**⚠️ Line moves to review Thursday morning**")

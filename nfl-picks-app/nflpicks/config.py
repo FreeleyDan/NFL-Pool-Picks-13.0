@@ -536,6 +536,154 @@ DYNAMIC_BLEND_LIVE = False
 DYNAMIC_BLEND_LARGE_DEVIATION = 5.0
 DYNAMIC_BLEND_MIN_TRAIN_DECIDED = 30
 
+# ---- Batch 5 (2026-11-05, group A items 1-2): situational spots / exact rest-travel-TZ ----
+# Both stay OFF / shadow by default: neither module is read by
+# model.py, weekly_run.py, or dashboard.py, and no pick changes.
+# SITUATIONAL_LIVE / REST_TRAVEL_EXACT_LIVE exist only so a future
+# promotion has a flag to flip -- flipping one now would be
+# inventing a live effect neither walk-forward test found (see
+# README batch 5 group A). All thresholds below are the TEST
+# definitions (spot cutoffs, train/test split, placebo size), not
+# live parameters.
+SITUATIONAL_LIVE = False
+REST_TRAVEL_EXACT_LIVE = False
+# Item 1 (situational.py): spot cutoffs. LOOKAHEAD_TOP_N = 5 (next
+# opponent a top-5 pre-week SRS team); SANDWICH_TOP_N = 8 (both
+# neighbours top-8); LETDOWN_BLOWOUT_PTS = 14 (previous win by
+# 14+); SHORTWEEK_DAYS = 3 (favourite on >= 3 fewer rest days).
+# MIN_TRAIN_DECIDED = 30: a spot with fewer decided training games
+# defaults to follow / zero adjustment -- do not flip a pick on a
+# handful of games. SPOT_ADJ_CAP = 3.0 pts clips any learned
+# additive adjustment. Train = 2019-2022 (where rules/coefs are
+# learned), test = 2023-2025 (where they are graded frozen).
+SITUATIONAL_LOOKAHEAD_TOP_N = 5
+SITUATIONAL_SANDWICH_TOP_N = 8
+SITUATIONAL_LETDOWN_BLOWOUT_PTS = 14
+SITUATIONAL_SHORTWEEK_DAYS = 3
+SITUATIONAL_MIN_TRAIN_DECIDED = 30
+SITUATIONAL_SPOT_ADJ_CAP = 3.0
+SITUATIONAL_TRAIN_SEASONS = (2019, 2020, 2021, 2022)
+SITUATIONAL_TEST_SEASONS = (2023, 2024, 2025)
+SITUATIONAL_PLACEBO_SEEDS = 20  # +/-0.15 pt placebo draws (backtest.placebo_rows)
+SITUATIONAL_PLACEBO_FLIP_TRIALS = 200  # random-flip draws for the fade-form placebo
+# Item 2 (rest_travel.py): OLS coefficient clips (no-intercept fits,
+# so the adjustment is 0 when the variable is 0). Rest clip 1.0
+# pts/day, travel 3.0 pts/1,000 mi, TZ 3.0 pts/zone -- all far above
+# any plausible fit (batch 1's coarse travel slope was ~0.95), so
+# they only stop a tiny-denominator fit from producing an absurd
+# value. Travel-binary threshold is 2,000 mi of extra away travel.
+REST_TRAVEL_REST_COEF_CLIP = 1.0
+REST_TRAVEL_TRAVEL_COEF_CLIP = 3.0
+REST_TRAVEL_TZ_COEF_CLIP = 3.0
+REST_TRAVEL_BINARY_MILES = 2000
+
+# ---- Batch 5 (2026-11-05, group C items 8-9): per-game explanations
+# and flip sensitivity (explain.py / sensitivity.py) ----
+# Display only: both modules read numbers model.py already computed
+# (model_independent, the judged line, cover_prob, flags) and turn
+# them into words. No pick logic reads either module, no flag gates
+# them, and nothing here changes a pick, an edge, or a line. The two
+# thresholds below are the plain-English fragility labels in
+# sensitivity.py, not model parameters: a pick that flips on a
+# 0.5-point line move is fragile (one half-point move -- the
+# smallest a line normally moves -- flips it), and a pick that
+# needs a 3-point move is a real lean. Between the two it is a
+# thin lean. They are in config.py so the labels are tunable in
+# one place, like every other display threshold in this file.
+SENSITIVITY_FRAGILE_PTS = 0.5
+SENSITIVITY_SOLID_PTS = 3.0
+
+# ---- Batch 5 (2026-11-05, group B items 3-5): kickoff weather / unit
+# depletion / referees & coaches ----
+# All three stay OFF / shadow by default: none of the modules is read
+# by model.py, weekly_run.py, or dashboard.py, and no pick changes.
+# The flags exist only so a future promotion has something to flip --
+# flipping one now would be inventing a live effect no walk-forward
+# test found (see README batch 5 group B). All thresholds below are
+# the TEST definitions, not live parameters.
+WEATHER_KICKOFF_LIVE = False
+UNIT_DEPLETION_LIVE = False
+REF_COACH_LIVE = False
+# Item 3 (kickoff_weather.py). Open-Meteo has two endpoints: the
+# FORECAST API (no key, ~16-day horizon, daily values in weather.py)
+# and the ARCHIVE API (same host, hourly values for any past date).
+# Kickoff weather uses HOURLY values at the kickoff hour in the
+# stadium's local time -- never a daily max/average. nflverse
+# `gametime` is Eastern Time, so the kickoff hour is converted ET ->
+# stadium-local with the DST-aware offsets in rest_travel.py.
+# STADIUM_TIMEZONES is the IANA name per home team (for the
+# timezone=auto request the API returns local times; the name is
+# used to pick the right hour and to validate the response).
+# Neutral venues (London / Munich / Frankfurt / Sao Paulo /
+# Mexico City) are keyed by stadium name, mirroring
+# rest_travel._NEUTRAL_VENUES. A dome/closed roof means no weather
+# applies at all (None, not a fetched value).
+WEATHER_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_KICKOFF_CACHE_DIR = None  # set to a directory to cache raw API JSON on disk
+WEATHER_KICKOFF_WIND_PASS_MPH = 15  # wind at/above this is "windy" for the pass interaction
+WEATHER_KICKOFF_WIND_HIGH_MPH = 20  # second, stricter wind cutoff
+WEATHER_KICKOFF_COLD_F = 32  # temp at/below this is "cold" for the run interaction
+WEATHER_KICKOFF_ADJ_CAP = 3.0  # max |points| any learned weather adjustment may move a margin
+WEATHER_KICKOFF_MIN_TRAIN_DECIDED = 30  # decided train games before a variant is learned at all
+STADIUM_TIMEZONES = {
+    "BUF": "America/New_York", "MIA": "America/New_York", "NE": "America/New_York",
+    "NYJ": "America/New_York", "NYG": "America/New_York", "PHI": "America/New_York",
+    "WAS": "America/New_York", "PIT": "America/New_York", "CLE": "America/New_York",
+    "CIN": "America/New_York", "ATL": "America/New_York", "CAR": "America/New_York",
+    "TB": "America/New_York", "JAX": "America/New_York", "IND": "America/New_York",
+    "DET": "America/Detroit", "BAL": "America/New_York",
+    "CHI": "America/Chicago", "GB": "America/Chicago", "MIN": "America/Chicago",
+    "DAL": "America/Chicago", "HOU": "America/Chicago", "TEN": "America/Chicago",
+    "NO": "America/Chicago", "KC": "America/Chicago",
+    "DEN": "America/Denver", "ARI": "America/Phoenix",  # ARI never observes DST
+    "SEA": "America/Los_Angeles", "SF": "America/Los_Angeles", "LA": "America/Los_Angeles",
+    "LAC": "America/Los_Angeles", "LV": "America/Los_Angeles",
+}
+NEUTRAL_VENUE_TIMEZONES = {
+    "Tottenham Stadium": "Europe/London", "Wembley Stadium": "Europe/London",
+    "Allianz Arena": "Europe/Berlin", "Deutsche Bank Park": "Europe/Berlin",
+    "Arena Corinthians": "America/Sao_Paulo", "Azteca Stadium": "America/Mexico_City",
+}
+# Item 4 (unit_depletion.py). Starter sets come from SNAP COUNTS, not
+# depth charts: depth charts changed schema after 2024 (week -> dt)
+# and are a single snapshot, while snap counts give a per-game,
+# point-in-time starter signal for every season 2019-2025. A starter
+# is OUT only when the week-W injury report lists them OUT or
+# DOUBTFUL -- Questionable does not count (batch-1 injury work:
+# questionable players suit up ~75-80% of the time). Groups and
+# starter counts: OL (T/G/C, top 5 by offense snaps), WR (top 3),
+# DL (DE/DT/NT, top 4 by defense snaps), CB (top 3). The lookback is
+# the team's most recent 4 played games before week W (spanning
+# seasons when early in a season). The interaction flag needs the
+# opponent's point-in-time pressure_generated (features.py) in the
+# top quartile of that week's league.
+UNIT_GROUPS = {
+    "OL": {"positions": ("T", "G", "C"), "snaps": "offense_snaps", "n_starters": 5},
+    "WR": {"positions": ("WR",), "snaps": "offense_snaps", "n_starters": 3},
+    "DL": {"positions": ("DE", "DT", "NT"), "snaps": "defense_snaps", "n_starters": 4},
+    "CB": {"positions": ("CB",), "snaps": "defense_snaps", "n_starters": 3},
+}
+UNIT_OUT_STATUSES = {"Out", "Doubtful"}
+UNIT_LOOKBACK_GAMES = 4
+UNIT_MIN_TRAIN_DECIDED = 30
+UNIT_ADJ_CAP = 3.0
+UNIT_TOP_RUSH_QUARTILE = 0.75
+# Item 5 (refs_coaches.py). Referee and head-coach tendencies, both
+# point-in-time (a ref/coach's stats use only games before week W).
+# 4th-down aggressiveness is NOT testable from available data:
+# the nflverse play-by-play release (csv.gz and parquet, both tried
+# 2026-11-05) 404s, exactly as batch 2 found, so no go-rate number
+# is computed or invented here -- see the module docstring.
+# Referee features: prior mean (actual - line) residual on the ref's
+# games (home-margin units; positive = home covers more than the
+# line) and prior mean (actual total - total_line). Coach features:
+# prior mean residual in the coach's team's favour, and prior ATS%.
+# Minimum prior games before a ref/coach's stats are used at all.
+REF_COACH_MIN_PRIOR_GAMES = 10
+REF_COACH_MIN_TRAIN_DECIDED = 30
+REF_COACH_ADJ_CAP = 3.0
+
 # ---- Survivor pool ----
 # NFL win probability from a point spread, via a logistic curve fit to
 # historical spread -> win% (the standard "13.5 point stdev" approximation).

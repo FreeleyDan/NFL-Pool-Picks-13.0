@@ -64,6 +64,14 @@ Configuration (all in config.py, all env-driven, all optional):
 * PICKS_GITHUB_BRANCH (default "main"), PICKS_GITHUB_DB_PATH
   (default "nfl-picks-app/nfl_picks.db" -- the path inside the
   repo), PICKS_COMMITTED_DB_TIMEOUT_SECONDS, PICKS_COMMITTED_DB_MAX_BYTES.
+* PICKS_GITHUB_TOKEN -- only needed for a PRIVATE repo (the
+  raw URL returns 401/404 without one). It is read from the
+  environment at fetch time, never stored in code, never put
+  in a URL, and never logged. See setup_instructions() for the
+  exact setup steps, including where to put these values in
+  Streamlit Cloud (its Secrets store -- Streamlit Cloud has no
+  plain env-var UI, so the dashboard bridges st.secrets into
+  os.environ via apply_streamlit_secrets()).
 
 Honest limitations (also in the README item-8 section):
 
@@ -160,6 +168,158 @@ def describe_source() -> dict:
                      "reads its local deployment database only, which can diverge "
                      "from the workflow-committed database -- see README batch-4 "
                      "group D item 8.")}
+
+
+def setup_instructions() -> dict:
+    """Exact setup steps for turning the committed-DB sync on
+    (batch 5, group C, item 7). Built in batch 4 but never turned
+    on: the sync button does nothing until one source below is
+    configured, and for a PRIVATE repo that source also needs a
+    token. Returns {"env_vars", "token", "streamlit_cloud",
+    "local", "verify", "dashboard_shows"} -- all plain text, no
+    token value anywhere (there is no token value to include:
+    the user creates it in their own GitHub account, and it is
+    never stored in code, docs, or tests).
+
+    The two things this function does NOT do, on purpose: it
+    does not name a repo (the audit checkout has no git remote,
+    so "owner/repo" is a placeholder the user fills in from
+    their own repo's URL), and it does not create or fetch a
+    token -- creating one is a user step in GitHub settings.
+    """
+    return {
+        "env_vars": [
+            {"name": "PICKS_GITHUB_REPO",
+             "value": "owner/repo -- your repo's actual owner/name, taken "
+                      "from its GitHub URL (no default is provided: the "
+                      "checkout has no git remote to derive one from, so "
+                      "do not guess -- copy it from the URL)",
+             "required": True,
+             "note": "The repo-derived source. The other two sources below "
+                     "are alternatives, not additions -- set ONE source."},
+            {"name": "PICKS_GITHUB_BRANCH",
+             "value": "main (default -- only set if your default branch differs)",
+             "required": False,
+             "note": "Which branch the committed DB is read from."},
+            {"name": "PICKS_COMMITTED_DB_URL",
+             "value": "full raw URL to the committed DB file",
+             "required": False,
+             "note": "Alternative source that wins over the repo-derived URL. "
+                     "Only needed if you do not want to use PICKS_GITHUB_REPO."},
+            {"name": "PICKS_COMMITTED_DB_FILE",
+             "value": "local path to a committed-DB copy",
+             "required": False,
+             "note": "Alternative source for a shared-store / mounted file. "
+                     "No network, no token. Wins over the repo-derived URL."},
+        ],
+        "token": {
+            "name": "PICKS_GITHUB_TOKEN",
+            "when_needed": "Only for a PRIVATE repo. A public repo needs no token. "
+                           "Without one, the raw fetch fails (401/404) and the "
+                           "dashboard reports the committed source unreachable -- "
+                           "which looks identical to a missing file, by design.",
+            "how_to_create": ("GitHub -> Settings -> Developer settings -> Personal access tokens "
+                              "-> Fine-grained tokens -> Generate new token: this repo only, "
+                              "Contents read-only. Or a classic token with the `repo` scope. "
+                              "Copy the value once -- GitHub never shows it again."),
+            "never": ("Never paste the token into code, a doc, a test, a chat message, "
+                      "or a commit. It goes only in the Secrets store (Streamlit Cloud) "
+                      "or your shell environment (local). This module sends it only as "
+                      "an Authorization header, never in a URL or a log."),
+        },
+        "streamlit_cloud": [
+            "Open the app on share.streamlit.io -> Manage app (bottom right) -> Settings -> Secrets.",
+            "Add, in TOML form (one per line, quotes included):",
+            '  PICKS_GITHUB_REPO = "owner/repo"',
+            '  PICKS_GITHUB_TOKEN = "paste the token here, once"',
+            "Save -- Streamlit Cloud reboots the app, and the dashboard bridges "
+            "these Secrets into the environment on load (apply_streamlit_secrets).",
+            "Streamlit Cloud has no plain env-var UI -- Secrets is the only place "
+            "these values can be set there. Do not put them in the repo.",
+        ],
+        "local": [
+            "Export in the shell before running the dashboard, e.g.:",
+            '  export PICKS_GITHUB_REPO="owner/repo"',
+            '  export PICKS_GITHUB_TOKEN="..."   # private repo only',
+            "  streamlit run dashboard.py",
+            "An already-set environment variable always wins over a Secret of "
+            "the same name (apply_streamlit_secrets never overwrites).",
+        ],
+        "verify": [
+            "Reload the dashboard. The banner above the picks changes from "
+            "'local database only' to either a match note ('local slate matches "
+            "the committed slate') or a divergence warning with a Sync button.",
+            "Check the committed run time shown there against the expected "
+            "Thursday workflow run -- raw GitHub fetches can lag a fresh push "
+            "by minutes (CDN cache), so a committed run_time older than the "
+            "last scheduled run means wait and re-check, not that the sync is broken.",
+            "Click 'Sync this dashboard to the committed slate' once: the success "
+            "note lists how many workflow tables were replaced and confirms the "
+            "user tables (manual adjustments, pool overrides, survivor used teams, "
+            "pool results, pool standings) were preserved.",
+            "If it still says unreachable: confirm the repo name (owner/repo, "
+            "exact case), the branch, and -- for a private repo -- that "
+            "PICKS_GITHUB_TOKEN is set and has Contents read-only on that repo.",
+        ],
+        "dashboard_shows": ("When nothing is configured, the dashboard says: "
+                            "local database only, no committed-DB source configured, "
+                            "and names PICKS_GITHUB_REPO (+ PICKS_GITHUB_TOKEN for a "
+                            "private repo) as what to set. That message is the "
+                            "unconfigured state -- not a silent fallback."),
+    }
+
+
+# Env-var names the Streamlit Secrets bridge knows about. Unknown
+# secret keys are ignored (a typo'd secret must not become an env
+# var), and a value is never returned or logged -- the caller gets
+# only the list of names that were set.
+_SECRETS_BRIDGE_KEYS = (
+    "PICKS_GITHUB_REPO", "PICKS_GITHUB_TOKEN", "PICKS_GITHUB_BRANCH",
+    "PICKS_COMMITTED_DB_URL", "PICKS_COMMITTED_DB_FILE",
+)
+
+
+def apply_streamlit_secrets(secrets) -> list[str]:
+    """Bridge Streamlit Cloud Secrets into os.environ (batch 5,
+    group C, item 7).
+
+    Streamlit Cloud has no plain env-var UI: values set in App
+    Settings -> Secrets arrive as st.secrets, not os.environ.
+    The dashboard calls this once on load with st.secrets, so a
+    Secrets-configured PICKS_GITHUB_REPO / PICKS_GITHUB_TOKEN
+    reaches committed_db.describe_source() / fetch. Rules:
+
+    * Only the known keys in _SECRETS_BRIDGE_KEYS are copied;
+      anything else in Secrets is ignored.
+    * An already-set environment variable always wins -- a
+      Secret never overwrites os.environ (local runs keep working
+      unchanged, and a deliberate local override is respected).
+    * Returns only the NAMES that were set, never any value.
+      A missing/empty Secrets object (local run, or no Secrets
+      configured) returns [] instead of raising, so the dashboard
+      call is safe to make unconditionally in a try/except.
+    * `secrets` is any mapping (st.secrets behaves like one);
+      non-mapping input returns [].
+    """
+    try:
+        items = list(secrets.items())
+    except Exception:
+        return []
+    applied = []
+    for key, value in items:
+        if key not in _SECRETS_BRIDGE_KEYS:
+            continue
+        if os.environ.get(key):
+            continue
+        try:
+            text = str(value).strip()
+        except Exception:
+            continue
+        if not text:
+            continue
+        os.environ[key] = text
+        applied.append(key)
+    return applied
 
 
 def committed_db_url(source: dict | None = None) -> str | None:

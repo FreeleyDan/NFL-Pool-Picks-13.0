@@ -25,6 +25,8 @@ nflpicks/
 weekly_run.py   the weekly job: pulls data, predicts, saves (email is opt-in only)
 dashboard.py    Streamlit UI -- this replaces the spreadsheet as your daily view
 .github/workflows/weekly.yml   free scheduled runs via GitHub Actions (at repo root)
+.github/workflows/tests.yml    compile + unit tests on every push/PR (at repo root, batch 5 group C)
+nflpicks/explain.py + sensitivity.py   per-game "why" and flip sensitivity (labels only, batch 5 group C)
 tests/          unit tests for the bug fixes -- python -m unittest discover -s tests
 ```
 
@@ -2691,3 +2693,667 @@ a recorded change, and `attribution_for_week` says
 "unknown" for those weeks rather than reconstructing one.
 No GitHub push was made, no email was sent, no
 current-week picks or leans are in this section.
+
+## Backtest batch 5, group A (2026-11-05, items 1-2) -- situational spots + exact rest/travel/TZ: built, tested, NOTHING promoted
+
+Run it yourself (local games.csv; no network, no team-stats fetch):
+
+```bash
+python - << 'PY'
+import pandas as pd
+from nflpicks import backtest, situational, rest_travel
+games = backtest.load_games_frame(pd.read_csv("/path/to/games.csv", low_memory=False))
+print(situational.evaluate_all(games)["promoted_spots"])  # [] -- see gate below
+print(rest_travel.evaluate_all(games)["promoted_variants"])  # [] -- see gate below
+PY
+```
+
+**Shared harness.** Both modules replay the baseline through
+`situational.replay_with_context()` -- the same loop as
+`backtest.evaluate_variant("baseline")` (ratings from season-S
+games before week W plus the full season S-1, point-in-time
+empirical HFA, `model.predict_game` for the margin) -- and the
+replay reproduces the canonical baseline EXACTLY (50.03% ATS,
+898/1,795 decided, MAE 10.34 on 2019-2025, n=1,871). If it ever
+does not, the numbers built on it are not to be trusted.
+Grading uses the batch-4 corrected push rule throughout. The
+promotion gate is the same for every test in this batch (ALL
+must hold): the variant wins on the TEST split (2023-2025,
+coefficients/rules learned on TRAIN 2019-2022 only and frozen),
+its full-sample paired p-value survives Bonferroni across its
+family, AND it beats the placebo gate. The placebo gate is
+computed on the TEST split, not the full sample: a paired delta
+on ~782 decided test games has wider chance variation than one
+on 1,795, so a full-sample placebo p95 would be too lenient.
+Additive placebo = `backtest.placebo_rows()` (+/-0.15 pt, 20
+seeds): test-split distribution mean -0.08 pp, SD 0.18, p95
++0.26 pp. Fade placebo = random flips of the same number of
+picks (200 draws, seeded): p95 +2.43 to +3.45 pp depending on
+how many picks the rule flips -- randomly flipping 100-280
+picks moves ATS by that much, and the gate prices that in.
+
+**Item 1 -- Situational spots (`nflpicks/situational.py`):
+built, tested, NOT promoted.** Six pre-registered spots, all
+defined on the team the model PICKS, from schedule + prior
+results + pre-week blended SRS ratings only (a future week's
+OPPONENT identity is schedule info, known in advance; the
+opponent's STRENGTH rank is always the pre-week rating, never
+a full-season rating): lookahead_div (next game is a division
+rival), lookahead_strong (next opponent top-5 pre-week),
+letdown_upset (won the previous game outright as an underdog),
+letdown_blowout (won the previous game by 14+), sandwich
+(favourite whose previous AND next opponents are both top-8),
+shortweek_fav (favourite on 3+ fewer rest days than its
+opponent). Two forms per spot (12 tests, one Bonferroni
+family): a fade rule (flip the pick on spot games, only if the
+spot's training ATS% is below 50% with >= 30 decided training
+games, else follow) and an additive adjustment (shift the
+margin by the spot's training mean residual, clipped to
++/-3 pts). Descriptive ATS% on the model's side, full sample:
+
+| spot | n (decided) | ATS% | train ATS% | test ATS% |
+|---|---|---|---|---|
+| lookahead_div | 656 (628) | 47.29 | 47.91 | 46.47 |
+| lookahead_strong | 270 (260) | 48.08 | 45.39 | 51.85 |
+| letdown_upset | 346 (333) | 49.25 | 46.35 | 53.19 |
+| letdown_blowout | 317 (303) | 47.52 | 45.68 | 49.65 |
+| sandwich | 43 (41) | 36.59 | 39.13 | 33.33 |
+| shortweek_fav | 56 (54) | 40.74 | 44.44 | 37.04 |
+
+Walk-forward results (fade form, test split, always-follow
+49.10% ATS on the same 782 decided test games): lookahead_div
+is the only fade with a positive test delta, +2.43 pp
+(51.53% vs 49.10%, paired z=1.16, p=0.2467, Bonferroni 1.0,
+279 flips) -- and it does NOT beat its random-flip placebo
+p95 (+3.45 pp), so it fails the gate on two counts. The other
+fades are zero or negative on test (lookahead_strong -0.51 pp,
+letdown_upset -1.15 pp, letdown_blowout +0.13 pp). The
+additive form is worse everywhere: best test delta is
++0.13 pp (letdown_upset, z=0.33), the rest are 0.00 to
+-0.13 pp, all Bonferroni 1.0. Two spots look eye-catching in
+the descriptive column and are NOT acted on, by design:
+sandwich (36.59%) and shortweek_fav (40.74%) each have fewer
+than 30 decided TRAINING games (23 and 27), so their rule
+defaults to follow and their adjustment to 0.0 -- a 41-game
+descriptive is not a finding, and their per-season ATS% is
+unstable (sandwich: 14.29% in 2024, 57.14% in 2025, on 7
+decided games each). The training wins that evaporate are
+themselves the point of the gate: letdown_upset trained at
+46.35% (fade) and tested at 53.19% on the model's side, so
+fading it on test LOSES 1.15 pp; lookahead_strong is the same
+story (45.39% train, 51.85% test). `SITUATIONAL_LIVE` stays
+False; nothing in `model.py`, `weekly_run.py`, or
+`dashboard.py` reads the module.
+
+**Item 2 -- Exact rest, travel, time zones
+(`nflpicks/rest_travel.py`): built, tested, NOT promoted.**
+What "exact" means here, vs the coarse versions in batch 1:
+rest is the games.csv `home_rest`/`away_rest` columns (exact
+days since the last game -- verified: week-2 Thursday teams
+show 4, Sunday teams 7; differential runs -8..+8, with 1,210
+of 1,871 games at exactly 0); travel is haversine miles from
+the stadium of a team's PREVIOUS game to this game's stadium
+(a multi-week road trip flies far less than home->away
+implies; a London game far more -- MIN flew 3,842.5 mi into
+Tottenham in 2024 week 5, NYJ 3,460.2 mi; week-1 origin is
+the home stadium); time zones are DST-aware UTC offsets on
+the gameday (US zones shift in March/November, Arizona never
+shifts -- ARI vs DEN is 1 zone apart in October, 0 in
+December -- London/Munich on European dates, Sao Paulo /
+Mexico City unshifted), with eastward travel kept separate
+from zones crossed. Neutral venues resolve by stadium name
+(international venues directly; host stadiums like State Farm
+Stadium / Ford Field / SoFi via their team); an unknown venue
+yields no travel rather than an invented distance. Coverage
+is complete: travel and TZ are known for all 1,871 games
+(0 unadjusted in every variant). Eight pre-registered
+variants, coefficients learned on TRAIN (2019-2022) only by
+no-intercept OLS of the point-in-time residual on the
+continuous variable (rest variants fit against the margin
+EXCLUDING the live 0.25/day term; travel/TZ variants against
+the baseline margin, which contains no travel term), clipped,
+then frozen for TEST:
+
+| variant | train coef | test ATS% vs 49.10% base | test paired delta | full ATS% | p (Bonf.) |
+|---|---|---|---|---|---|
+| rest_linear | -0.0503 pts/day | 49.43 | +0.38 pp (z=0.63) | 49.45 | 1.0 |
+| rest_piecewise | +0.28 home-rested / -0.39 away-rested | 48.80 | -0.13 pp | 49.47 | 1.0 |
+| rest_fav_only | +0.2463 pts/day (n=192) | 49.30 | +0.26 pp | 49.81 | 1.0 |
+| travel_linear | +0.163 pts/1,000 mi | 49.87 | +0.13 pp | 50.47 | 1.0 |
+| travel_binary | +2.891 pts (n=55 train) | 48.53 | -0.64 pp | 49.78 | 1.0 |
+| tz_linear | +0.160 pts/zone | 48.86 | -0.51 pp | 50.03 | 1.0 |
+| tz_east | -0.634 pts/east zone | 49.68 | +0.38 pp | 50.33 | 1.0 |
+| travel_rest_combo | -0.048 rest / +0.063 travel | 49.56 | +0.26 pp | 49.67 | 1.0 |
+
+Reading the table honestly: the train-fitted rest slope is
+-0.05 pts/day -- essentially zero, matching batch 1's ATS
+residual slope of -0.03 +/- 0.12 and confirming the market
+already prices rest; replacing the live 0.25/day term with it
+LOSES 0.56 pp full-sample. The piecewise slopes look like an
+HFA interaction (rest helps a home team, +0.28, but a rested
+away team does worse than the model expects, -0.39) -- but
+the variant loses on test (-0.13 pp) and full-sample
+(-0.56 pp), so the pattern does not survive walk-forward and
+is reported as coefficients, not a finding. The travel
+binary is the cleanest train-win-evaporates case in this
+batch: a +2.89 pt shift fit on 55 training games where the
+away team flew 2,000+ mi further (92 such games in all of
+2019-2025), which LOSES 0.64 pp on test -- and the model's
+own side was already 58.33% ATS on those 37 test games, so
+the shift's flips were the wrong direction. No variant's
+test delta beats the additive placebo p95 (+0.26 pp) AND a
+Bonferroni p < 0.05 -- rest_linear and tz_east clear the placebo threshold on the delta axis (+0.38 pp vs +0.26 pp) but fail
+Bonferroni outright (1.0), and every variant's full-sample
+MAE is within 0.08 pts of the baseline 10.34 (tz_east
+10.309 is the only MAE improvement, on a variant that is
++0.06 pp ATS full-sample -- noise on both axes).
+`TRAVEL_ENABLED` stays False (unchanged -- the exact travel
+term does no better than the coarse one it replaces) and
+`REST_TRAVEL_EXACT_LIVE` (new) stays False; the live rest
+term (0.25/day, capped 2.0) is unchanged, because no exact
+replacement beat it out-of-sample.
+
+**Still off by default, on purpose (this batch):**
+`SITUATIONAL_LIVE=False`, `REST_TRAVEL_EXACT_LIVE=False`
+(new), plus every flag from earlier batches (`EPA_LIVE`,
+`ENSEMBLE_LIVE`, `CALIBRATED_PICK`, `TRAVEL_ENABLED`,
+`INJ_AUTO_APPLY`, `TOTALS_SRS_LIVE`, `STALENESS_LIVE`,
+`UNCERTAINTY_PICK_USE`, `PBP_FEATURES_LIVE`,
+`TEAM_HFA_LIVE`, `DYNAMIC_BLEND_LIVE` -- all False,
+unchanged).
+
+**Files changed.** New: `nflpicks/situational.py` (spot
+definitions, fade/additive walk-forward tests, both placebo
+gates, shared point-in-time replay), `nflpicks/rest_travel.py`
+(exact rest/travel/TZ quantities, DST-aware offsets,
+8-variant walk-forward test), `tests/test_batch5_groupA.py`
+(22 tests). Changed: `nflpicks/config.py` (batch-5
+thresholds + the two new off-by-default flags only). Not
+changed, deliberately: `model.py`, `backtest.py`,
+`weekly_run.py`, `dashboard.py`, `.github/workflows/weekly.yml`,
+and every earlier README section.
+
+**Tests.** Full suite: 237/237 pass (215 prior + 22 new).
+`py_compile` clean on all changed files. Baseline before
+this batch: 215/215.
+
+**Limits that remain.** The lookahead/letdown spots use the
+most recent previous game, which after a bye is two weeks
+old -- a bye-week gap weakens a "coming off" story and is
+not modelled separately. Opponent-strength ranks use the
+same blended ratings as the pick, so they are in-sample
+w.r.t. the ratings (the same shrinkage caveat as team HFA);
+the walk-forward gate, not the rank, is the promotion test.
+Travel is great-circle stadium-to-stadium: it ignores
+actual flight routing, road-trip hotel stays, and the fact
+that a team may fly home between road games (the schedule
+cannot tell you that). TZ offsets are standard/DST rules,
+not the teams' actual travel clocks. The sandwich and
+shortweek_fav descriptives (36.59% / 40.74%) are the two
+numbers in this batch most likely to be quoted out of
+context -- both are sub-30-training-game descriptives that
+the gate deliberately refused to act on, and neither is a
+promotion candidate until a larger sample (seasons after
+2025) says otherwise. No GitHub push was made, no email was
+sent, no current-week picks or leans are in this section.
+
+## Backtest batch 5, group B (2026-11-05, items 3-5) -- kickoff weather + unit depletion + referees/coaches: built, tested, NOTHING promoted
+
+Run it yourself (local games.csv; team stats / snap counts / injuries
+fetched once from nflverse for items 3-4 -- see the `__main__` blocks):
+
+```bash
+python -m nflpicks.kickoff_weather /path/to/games.csv /path/to/nflverse-csvs
+python -m nflpicks.unit_depletion /path/to/games.csv /path/to/nflverse-csvs
+python -m nflpicks.refs_coaches /path/to/games.csv
+```
+
+**Shared harness.** All three modules replay the baseline through
+`situational.replay_with_context()` -- the same loop as group A --
+and every replay reproduces the canonical baseline EXACTLY (50.03%
+ATS, 898/1,795 decided, MAE 10.34 on 2019-2025, n=1,871). The
+promotion gate is the same as group A (ALL must hold): the variant
+wins on the TEST split (2023-2025, coefficients/rules learned on
+TRAIN 2019-2022 only and frozen), its full-sample paired p-value
+survives Bonferroni across its family, AND it beats the placebo
+gate (additive: +/-0.15 pt placebo p95 +0.26 pp on the test split;
+fade: random-flip placebo p95, computed per rule).
+
+**Item 3 -- Weather at kickoff (`nflpicks/kickoff_weather.py`):
+built, tested, NOT promoted.** Two halves: a live path and a
+backtest, kept separate on purpose.
+
+- Live path: hourly Open-Meteo values at the kickoff hour in the
+  stadium's local time -- archive API for past dates, forecast API
+  for upcoming games, both free with no key. `gametime` in
+  games.csv is Eastern, so the kickoff hour is converted ET ->
+  stadium-local with the DST-aware offsets from `rest_travel.py`
+  (Arizona never shifts; London 09:30 ET is 14:30 local). Domes
+  and closed roofs return None (weather does not apply indoors);
+  unknown stadiums and fetch failures also return None, never a
+  guessed value. Raw API JSON is cached on disk only when a
+  cache_dir is passed (`WEATHER_KICKOFF_CACHE_DIR` is None by
+  default); the test suite uses recorded fixtures
+  (`tests/fixtures/open_meteo_*.json`, real archive responses)
+  with requests monkeypatched, never live network.
+- Live-path validation against the recorded values (70 outdoor
+  games, all 30 wind-20+ games plus a 40-game random sample,
+  fetched once and cached): 70/70 fetched. Temperature agrees
+  well (MAE 2.51 F, corr 0.974). Wind agrees only moderately
+  (MAE 3.89 mph, corr 0.664) -- and the disagreement is worst
+  exactly where a wind adjustment would fire: PHI 2023-12-03
+  recorded 44 mph vs 2.4 fetched; SEA 2020-10-11 recorded 10
+  vs 23.3 fetched. Checking wind GUSTS does not resolve it
+  (PHI gust 8.7 vs recorded 44; SEA gust 41.2 vs recorded 10):
+  the game-book wind and the reanalysis wind are different
+  measurements, and neither is obviously "truth". Consequence,
+  stated plainly: even if the backtest had found a wind effect,
+  the live fetch could not reproduce the backtest's wind input
+  on the windiest games. The backtest below stands on the
+  recorded values; the live path is not trusted to match them.
+- Backtest (recorded kickoff wind/temp from games.csv -- kickoff
+  values, not daily averages -- plus point-in-time pass/run
+  shares from team stats). Descriptives on the model's side:
+  wind <15 mph 49.74% ATS (n=967 decided), 15-20 mph 46.15%
+  (n=104), 20+ mph 60.00% (n=30 -- noise, wrong direction);
+  temp >32 F 50.05% (n=1,037), <=32 F 43.75% (n=64), <=20 F
+  27.78% (n=18 -- noise). The totals-side check is also
+  inconsistent with the published wind claim: mean (actual
+  total - total_line) is +0.31 calm (n=996), -1.50 at 15-20 mph
+  (n=106), but +0.42 at 20+ mph (n=30); slope -0.083 pts per
+  mph above 15. The 15-20 bucket dips and the 20+ bucket does
+  not -- that is not a dose response.
+- Pre-registered additive variants (OLS slope on train, frozen):
+
+  | variant | train slope | train decided (x != 0) | test delta | full delta | p (Bonf.) |
+  |---|---|---|---|---|---|
+  | wind_x_pass (wind>15 x pass-share diff) | +5.62 | 67 | +0.13 pp (z=0.58) | +0.17 pp | 1.0 |
+  | wind20_x_pass (wind>20 x pass-share diff) | not learned | 20 | 0.00 pp | 0.00 pp | 1.0 |
+  | cold_x_run (cold x run-share diff) | not learned | 27 | 0.00 pp | 0.00 pp | 1.0 |
+
+  wind_x_pass is the only learned variant and it fails twice:
+  its test delta (+0.13 pp) is below the placebo p95 (+0.26 pp)
+  and its Bonferroni p is 1.0 -- and its train slope (+5.62) is
+  the WRONG sign for the hypothesis (it says wind helps the
+  pass-heavy team, relative to the model). The other two never
+  clear the 30-decided-training-game floor, so their adjustment
+  is 0.0 by design, not by fitting. Precipitation is not tested
+  at all: games.csv carries no precipitation column, and the
+  live fetch returns precip_mm at kickoff for future use, but
+  no precip number was invented for the backtest.
+  `WEATHER_KICKOFF_LIVE` stays False. The existing daily
+  totals-model weather adjustment in `weather.py` is untouched
+  (it was never the subject of this test).
+
+**Item 4 -- Player-level matchups / unit depletion
+(`nflpicks/unit_depletion.py`): built, tested, NOT promoted.**
+The machinery works; the events are too rare to test.
+
+- Starters come from SNAP COUNTS, not depth charts: the
+  depth-chart release changed schema after 2024 and is one
+  snapshot, while snap counts give a per-game point-in-time
+  starter signal for every season. Top-N by snaps over the
+  team's most recent 4 played games before week W: OL top 5
+  (T/G/C), WR top 3, DL top 4 (DE/DT/NT), CB top 3. A starter
+  is OUT only on an OUT/DOUBTFUL week-W injury report --
+  Questionable does not count (those players suit up ~75-80%
+  of the time). IR players never appear on the weekly report,
+  so a starter who went on IR in an earlier week is MISSED --
+  a stated limit, not a silent gap. QB is excluded on purpose:
+  the injuries module already owns QB value.
+- The starter definition was validated against the 2024 depth
+  charts (weeks 5/10/15) and 2023 week 10: 92-96% of
+  snap-count OL starters are depth-1 players, WR 83-89%, DL
+  ~81%, CB 73-82%. (The reverse share is ~0.5 because depth
+  charts list more depth-1 players than the top-N -- e.g. slot
+  receivers and rotating linemen -- so the snap set is a subset
+  of the real starter pool, not a different pool.) Injury joins
+  are by normalised name within team, with a last-name +
+  first-initial fallback for suffix/punctuation mismatches
+  (71 fallback matches across 3,920 starter team-weeks).
+- Descriptives on the model's side (picked team flagged):
+
+  | flag | n (decided) | ATS% | train ATS% | test ATS% |
+  |---|---|---|---|---|
+  | ol_out2 | 33 (32) | 40.62 | 26.67 (15) | 52.94 (17) |
+  | wr_out2 | 13 (13) | 53.85 | 42.86 (7) | 66.67 (6) |
+  | dl_out2 | 5 (3) | 66.67 | 0.00 (1) | 100.00 (2) |
+  | cb_out2 | 16 (15) | 26.67 | 33.33 (9) | 16.67 (6) |
+  | any_out2 | 63 (59) | 40.68 | 33.33 (30) | 48.28 (29) |
+  | ol_out2_vs_toprush | 7 (7) | 57.14 | 66.67 (3) | 50.00 (4) |
+
+  Two starters out in the same unit in the same week is rare
+  (~5 ol_out2 games per season) -- the counts above are the
+  finding as much as the percentages. ol_out2's train 26.67%
+  evaporates to 52.94% on test, the classic train-win pattern.
+  cb_out2 holds its direction (33.33% train, 16.67% test) but
+  on 6 test games -- far below any floor for action. Every
+  flag except any_out2 defaults to follow / 0.0 adjustment
+  because its training sample is below the 30-decided-game
+  floor. any_out2 is the only tested rule: fade on test is
+  exactly 0.00 pp (13 right / 13 wrong on 30 flips, flip
+  placebo p95 +1.28 pp) and the additive form is -0.26 pp
+  (adjustment +0.77, MAE 10.319 vs 10.305 follow). Both fail
+  the gate. `UNIT_DEPLETION_LIVE` stays False. The flags are
+  shadow-only: a Thursday review can look at them, but no
+  number here justifies moving a pick.
+
+**Item 5 -- Referee crews and coaching tendencies
+(`nflpicks/refs_coaches.py`): built, tested, NOT promoted.**
+As expected: noise.
+
+- Referee: prior mean (actual - line) and prior home ATS% over
+  the ref's earlier games (point-in-time, >= 10 priors). Career
+  2019-2025 home ATS% across the 20 refs with >= 30 games runs
+  38.89% (Bill Vinovich, n=111) to 60.38% (John Hussey, n=111)
+  -- a wide spread, but with n~110 the SE is ~4.7 pp and 20
+  refs guarantee extremes. Penalty rates are NOT tested:
+  games.csv has no penalty counts, so no penalty claim is made.
+  The totals version (prior mean actual total minus total_line)
+  ranges -1.52 to +1.70 across refs (SD 0.75) -- no ref is a
+  big over/under ref either. Data-quality note: referee names
+  have variants (Ron Torbert n=80 and Ronald Torbert n=31 are
+  presumably the same person, split across two spellings), so
+  per-ref samples are slightly understated.
+- Coach: prior mean residual in the coach's team's favour and
+  prior ATS%, following the coach across teams. Career
+  2019-2025 ATS% (n>=30) runs 27.27% (Brian Callahan, n=34) to
+  65.06% (Dan Campbell, n=85), with Jim Harbaugh 64.71%
+  (n=34) and Brian Flores 60.42% (n=49) near the top. Those
+  career numbers conflate coach quality with team quality and
+  era -- the SRS model already prices the team, so the
+  walk-forward test is the arbiter, and it says the record does
+  not persist: both coach variants fit NEGATIVE train slopes
+  (coach_resid -0.26, coach_ats -3.65), i.e. the train data
+  itself says to fade the coach effect, and both lose on test
+  anyway.
+- 4th-down aggressiveness is NOT tested: the nflverse
+  play-by-play release 404s on both the csv.gz and parquet
+  URLs (checked 2026-11-05), exactly as batch 2 found. No
+  go-rate number is computed, approximated from team totals,
+  or invented; `refs_coaches.PBP_AVAILABLE` is False and
+  `fourth_down_aggressiveness()` returns None until a working
+  PBP source is confirmed.
+- Pre-registered additive variants (OLS slope on train, frozen):
+
+  | variant | train slope | test delta | full delta | p (Bonf.) |
+  |---|---|---|---|---|
+  | ref_home | +0.06 | 0.00 pp | -0.17 pp | 0.95 |
+  | coach_resid | -0.26 | -0.38 pp | -0.06 pp | 1.0 |
+  | coach_ats | -3.65 | -0.26 pp | -0.11 pp | 1.0 |
+
+  ref_home's train slope (+0.06) is essentially zero -- a
+  ref's past home bias carries ~6% of itself forward, which is
+  no persistence at all. All three test deltas are <= 0 and
+  below the placebo p95 (+0.26 pp); none clears Bonferroni.
+  `REF_COACH_LIVE` stays False.
+
+**Still off by default, on purpose (this batch):**
+`WEATHER_KICKOFF_LIVE=False`, `UNIT_DEPLETION_LIVE=False`,
+`REF_COACH_LIVE=False` (all new), plus every flag from earlier
+batches (`EPA_LIVE`, `ENSEMBLE_LIVE`, `CALIBRATED_PICK`,
+`TRAVEL_ENABLED`, `INJ_AUTO_APPLY`, `TOTALS_SRS_LIVE`,
+`STALENESS_LIVE`, `UNCERTAINTY_PICK_USE`, `PBP_FEATURES_LIVE`,
+`TEAM_HFA_LIVE`, `DYNAMIC_BLEND_LIVE`, `SITUATIONAL_LIVE`,
+`REST_TRAVEL_EXACT_LIVE` -- all False, unchanged).
+
+**Files changed.** New: `nflpicks/kickoff_weather.py` (kickoff-hour
+Open-Meteo fetch + cache + recorded-value validation + 3-variant
+walk-forward test), `nflpicks/unit_depletion.py` (snap-count
+starter sets, injury-report depletion flags, depth-chart
+validation, 6-flag walk-forward test), `nflpicks/refs_coaches.py`
+(point-in-time ref/coach features, 3-variant walk-forward test,
+4th-down documented unavailable), `tests/test_batch5_groupB.py`
+(34 tests), `tests/fixtures/open_meteo_buf_20240908.json` and
+`tests/fixtures/open_meteo_den_20201219.json` (real recorded
+Open-Meteo archive responses for the fixture tests). Changed:
+`nflpicks/config.py` (batch-5 group B thresholds, stadium
+timezones, and the three new off-by-default flags only). Not
+changed, deliberately: `model.py`, `backtest.py`, `weather.py`
+(the daily totals-model weather path is untouched), `weekly_run.py`,
+`dashboard.py`, `.github/workflows/weekly.yml`, and every earlier
+README section.
+
+**Tests.** Full suite: 271/271 pass (237 prior + 34 new).
+`py_compile` clean on all changed files. Baseline before this
+batch: 237/237.
+
+**Limits that remain.** The kickoff-weather backtest grades
+realised (recorded) weather; a live forecast will sometimes be
+wrong on top of that, and the live fetch demonstrably disagrees
+with the recorded wind on the windiest games, so the live path
+needs its own validation before it could ever feed a pick --
+this batch validates the plumbing, not the forecast. The
+unit-depletion flags miss IR starters (weekly report only) and
+rest on name matching (71 fallback matches; a missed join
+understates depletion, it never invents it). The referee test
+cannot see penalty counts, only ATS/total outcomes, and ref
+name variants split a few samples. The coach test cannot see
+4th-down aggressiveness at all (no play-by-play source). All
+three items' headline numbers are nulls on 2019-2025; a real
+effect smaller than these gates can detect would need seasons
+after 2025 to show up. No GitHub push was made, no email was
+sent, no current-week picks or leans are in this section.
+
+## Backtest batch 5, group C (2026-11-05, items 6-9) -- tests on every push + committed-DB setup + per-game explanations + flip sensitivity: built, tested, NOTHING promoted
+
+No model change in this batch. Items 8-9 are labels/display only
+(they read numbers model.py already computed), item 6 is CI, and
+item 7 is setup/documentation for a feature built in batch 4.
+The canonical baseline is untouched -- every replay still
+reproduces 50.03% ATS (898/1,795 decided, MAE 10.34 on
+2019-2025, n=1,871) exactly, and no backtest was re-run here
+because no pick logic, rating, or blend changed. Nothing in
+this batch can change a pick, an edge, a line, or a grade.
+
+### Item 6 -- tests-on-every-push workflow: built, NOT pushed
+
+New file `.github/workflows/tests.yml` (repo root, next to
+`weekly.yml`), same pattern as the Stock Terminal repo's
+25-line tests workflow: on every push and pull request it
+checks out, sets up Python 3.12, installs
+`nfl-picks-app/requirements.txt`, compiles all modules
+(`python3 -m py_compile nfl-picks-app/nflpicks/*.py
+nfl-picks-app/*.py`), and runs the full suite
+(`python3 -m unittest discover -s tests -v` from
+`nfl-picks-app/`). All tests are offline -- no network calls,
+no secrets.
+
+Why a second workflow when `weekly.yml` already runs the tests
+first: `weekly.yml` only runs on its Tue/Thu schedule. A bad
+push on Monday would otherwise sit uncaught until Tuesday's
+run -- or worse, fail the Thursday run that matters for the
+pool deadline. `tests.yml` catches it on the push itself.
+
+NOT pushed by this batch: workflow files cannot be pushed
+through the GitHub contents API (it returns 403 on
+`.github/workflows/*`), exactly as established for the Stock
+Terminal workflow and for `weekly.yml`. This file was built
+locally and validated (YAML parses; the steps are the same
+commands run locally below). It must be added via the GitHub
+website or a git push from a local checkout -- see the note
+at the top of the file itself.
+
+### Item 7 -- committed-DB sync, configured: built, needs a user step
+
+The sync itself was built in batch 4 (group D, item 8:
+`committed_db.compare_to_local` /
+`sync_committed_to_local`, user tables preserved, run-time
+reported so CDN lag is visible). It was never turned on: the
+dashboard's sync button does nothing until a source is
+configured, and for a PRIVATE repo that source also needs a
+token. This item is the configuration, not a code change to
+the sync logic.
+
+What was built:
+
+* `committed_db.setup_instructions()` -- the exact setup, as
+  data the dashboard and README both draw on: which env vars
+  (`PICKS_GITHUB_REPO` -- required, `owner/repo` copied from
+  the repo's GitHub URL, no default provided and none guessed;
+  `PICKS_GITHUB_BRANCH` default `main`; alternatives
+  `PICKS_COMMITTED_DB_URL` / `PICKS_COMMITTED_DB_FILE`),
+  the token (`PICKS_GITHUB_TOKEN`, private repos only --
+  created in GitHub Settings -> Developer settings ->
+  Personal access tokens, fine-grained, this repo only,
+  Contents read-only, or a classic token with `repo` scope),
+  where to put them in Streamlit Cloud (App Settings ->
+  Secrets -- Streamlit Cloud has no plain env-var UI, so
+  Secrets is the only place), the local equivalent (export
+  in the shell before running the dashboard), and how to
+  verify (reload: the banner changes from "local only" to a
+  match note or a divergence warning with a Sync button;
+  check the committed run time against the expected
+  Thursday run; click Sync once and confirm the success
+  note lists replaced workflow tables and preserved user
+  tables).
+* `committed_db.apply_streamlit_secrets(secrets)` -- the
+  bridge that makes the Cloud path actually work: called
+  once on dashboard load with `st.secrets`, it copies only
+  the five known committed-DB keys into `os.environ`, never
+  overwrites an already-set env var, ignores unknown keys,
+  returns only the names set (never a value), and returns []
+  instead of raising when there are no Secrets. The dashboard
+  call is best-effort (try/except), so a local run without
+  Secrets is unchanged.
+* Dashboard unconfigured state: the old generic "local
+  database only" caption now names exactly what is missing
+  and what to set (`PICKS_GITHUB_REPO` + `PICKS_GITHUB_TOKEN`
+  for a private repo, App Settings -> Secrets in Streamlit
+  Cloud, export locally), and points at this README section
+  for the full steps and verification. When a repo-mode fetch
+  fails and no token is set, the dashboard adds the hint that
+  a missing token looks identical to a missing file (by
+  design in `fetch_committed_db_bytes`), so the failure is
+  diagnosable instead of opaque.
+
+What was NOT done, on purpose: no token was invented,
+created, stored, or written anywhere -- no token value
+exists in code, docs, or tests (the tests assert the
+instructions contain no `ghp_` / `github_pat_` string).
+Creating the token is a user step in their own GitHub
+account, and the repo name is theirs to copy from the URL.
+Until they do it, the dashboard keeps saying plainly that
+no committed source is configured; it never pretends a
+check happened.
+
+### Item 8 -- per-game explanations in plain English: built, display only
+
+New module `nflpicks/explain.py`: `explain_pick(game)` turns
+one stored pick row into a one-line "why" (factors joined
+with "; "), and `explain_picks(rows)` maps it over a slate.
+The dashboard shows it as a "Why" column on the ATS tab.
+Generated from the same numbers already computed -- no new
+model, no new data source, no pick-logic change. Every clause
+names a number already stored for that game; missing inputs
+are skipped, never invented (no line -> "No line yet ... no
+pick can be made until a Vegas or pool line exists").
+
+What a line can say, in order: the rating edge ("model rates
+KC 6.0 pts better than the Vegas line (-3.5)" -- pool line
+when one is set, since that is the judged line); market
+disagreement (`needs_review` -> "the market disagrees by 8.5
+pts -- verify the inputs before trusting this, do not bet
+bigger on it"; `strong_edge` -> "a strong model-vs-market
+gap"); cover prob, with <0.55 called "near a coin flip"; the
+uncertainty band, when the cover-prob range straddles 0.50
+("rating uncertainty alone could flip the favoured side");
+early-season sample ("confidence 0.45"); a >=1 pt live line
+move since the pool line locked (from `db.get_line_moves`,
+which the tab now computes once and reuses for its review
+section); injuries ("review-only, not in the number"); the
+weather note (totals only); and the total ("model 48.0 vs
+line 44.5 (OVER 44.5)"). If the stored pick string names the
+other side from the numbers, that is flagged in the line
+("stored pick names the other side -- check the row before
+submitting") instead of being papered over -- the submission
+sheet already does a sign check, and this is the same idea
+at the game level.
+
+### Item 9 -- sensitivity: what would change my pick?: built, display only
+
+New module `nflpicks/sensitivity.py`: `flip_analysis(model,
+line)` / `total_flip_analysis(model_total, total_line)` /
+`sensitivity_for_game(game)`. The dashboard shows the spread
+summary as a "What flips it" column on the ATS tab.
+
+The answer is one number, and there is nothing to fit: the
+pick follows the SIGN of (model_independent - line), and the
+blended edge has the same sign (blend weight is strictly
+positive), so the pick flips exactly when the line crosses
+the model read -- or, equivalently, when the model read
+crosses the line. The flip line IS the model read, the move
+needed IS |model - line|, and the rating change needed is
+the same magnitude in the opposite direction. The total pick
+flips the same way, when the total line crosses the model
+total. Labels (thresholds in `config.py`,
+`SENSITIVITY_FRAGILE_PTS = 0.5`, `SENSITIVITY_SOLID_PTS = 3.0`):
+<= 0.5 pts is "fragile" (the next half-point move -- the
+smallest a line normally moves -- flips it), >= 3.0 pts is a
+"real lean", between is a "thin lean". Example outputs:
+"Flips if the line moves 0.5 pts up (home more favoured) (to
++2.5) or the model moves 0.5 pts down -- fragile." At an exact
+tie the summary says "Already on the line -- any move flips
+this pick (fragile)." With no line there is no pick to flip,
+and the function says so instead of inventing a number.
+
+A fragile pick is not a wrong pick -- it is one a Thursday
+line move can take away from you, which is why it sits next
+to the "Why" column rather than in a model table.
+
+**Still off by default, on purpose (this batch):** no new
+flag was added -- items 8-9 need none (display only) and
+items 6-7 are CI/setup. Every flag from earlier batches
+(`EPA_LIVE`, `ENSEMBLE_LIVE`, `CALIBRATED_PICK`,
+`TRAVEL_ENABLED`, `INJ_AUTO_APPLY`, `TOTALS_SRS_LIVE`,
+`STALENESS_LIVE`, `UNCERTAINTY_PICK_USE`, `PBP_FEATURES_LIVE`,
+`TEAM_HFA_LIVE`, `DYNAMIC_BLEND_LIVE`, `SITUATIONAL_LIVE`,
+`REST_TRAVEL_EXACT_LIVE`, `WEATHER_KICKOFF_LIVE`,
+`UNIT_DEPLETION_LIVE`, `REF_COACH_LIVE` -- all False,
+unchanged) is now asserted False by
+`tests/test_batch5_groupC.py`, so a future batch cannot
+silently flip one while adding display code.
+
+**Files changed.** New: `nflpicks/explain.py` (item 8),
+`nflpicks/sensitivity.py` (item 9),
+`tests/test_batch5_groupC.py` (39 tests),
+`.github/workflows/tests.yml` (item 6, not pushed -- see
+above). Changed: `nflpicks/config.py` (two sensitivity
+label thresholds only), `nflpicks/committed_db.py`
+(`setup_instructions()` + `apply_streamlit_secrets()` +
+token doc, item 7; sync logic untouched),
+`dashboard.py` (Secrets bridge call, exact
+unconfigured-state wording + token hint, Why / What-flips-it
+columns, line-moves fetch moved up and reused; no pick, line,
+or grade logic touched), `README.md` (this section + the
+architecture list). Not changed, deliberately: `model.py`,
+`backtest.py`, `weekly_run.py`, `.github/workflows/weekly.yml`,
+`grading.py`, `db.py`, and every earlier README section. The
+play-by-play source question from earlier batches is not
+re-litigated here: this batch touches no pbp claim, and the
+item-5 re-check discrepancy (a worker reporting the nflverse
+pbp release 404ing again vs batch 3's confirmed source) is
+still unresolved -- nothing in this section asserts the 404
+as settled fact.
+
+**Tests.** Full suite: 310/310 pass (271 prior + 39 new). `py_compile` clean on all changed files
+(`nflpicks/*.py`, `dashboard.py`, `weekly_run.py`), and the
+new workflow file parses as YAML with the expected triggers
+(push + pull_request), compile step, and unittest step.
+Baseline before this batch: 271/271.
+
+**Limits that remain.** The dashboard was not clicked live:
+Streamlit is not installed in this environment, so the Why /
+What-flips-it columns, the Secrets bridge call, and the new
+unconfigured-state wording are compile-checked and
+unit-tested at the function level, not live-rendered -- the
+column-count logic for all four cover-prob present/absent
+cases was verified offline against fake pick rows (20/19/19/18
+columns, matching headers in every case). The tests workflow
+has not run on GitHub Actions (it cannot be pushed from here
+-- see item 6), so its first real run is still to be
+confirmed after the pusher adds it. The committed-DB sync
+still needs the user's token + repo name before the Sync
+button does anything; until then the dashboard's honest
+state is "local only". No GitHub push was made, no email was
+sent, no current-week picks or leans are in this section.
