@@ -106,10 +106,34 @@ CREATE TABLE IF NOT EXISTS pool_line_overrides (
 -- the dashboard flags edge flips and >1 pt moves for Thursday review.
 -- The pool line is NEVER auto-switched: it is what the user is judged
 -- against, so a move only ever produces a review flag.
+-- Market cross-checks (batch 2, item 6, added 2026-11-04): all three
+-- market lines for a game (spread, both moneylines, total) plus the
+-- computed cross-check flags, one row per game. This is a LOG, not a
+-- line source: nothing in the app reads a line back out of this table
+-- to drive a pick, so it can never auto-switch the pool line.
+CREATE TABLE IF NOT EXISTS market_crosschecks (
+    season INTEGER, week INTEGER, home_team TEXT, away_team TEXT,
+    spread_line REAL, home_moneyline REAL, away_moneyline REAL, total_line REAL,
+    ml_home_win_prob REAL, ml_implied_margin REAL, flags TEXT, run_time TEXT,
+    PRIMARY KEY (season, week, home_team, away_team)
+);
+
 CREATE TABLE IF NOT EXISTS line_snapshots (
     season INTEGER, week INTEGER, home_team TEXT, away_team TEXT,
     source TEXT, line REAL, run_time TEXT,
     PRIMARY KEY (season, week, home_team, away_team, source)
+);
+
+-- Manual-adjustment grading summary (item 7c, added 2026-11-04):
+-- one row per scope (adjusted / unadjusted / all) per season, written
+-- by adjustment_grading.save_adjustment_grades(). This is a SUMMARY
+-- only: the per-game source of truth stays in picks (which already
+-- stores manual_adj_home/manual_adj_away per game) plus actual
+-- results, and the summary is recomputed from those on demand.
+CREATE TABLE IF NOT EXISTS adjustment_grades (
+    season INTEGER, scope TEXT, games INTEGER, wins INTEGER,
+    losses INTEGER, pushes INTEGER, ats_pct REAL, run_time TEXT,
+    PRIMARY KEY (season, scope)
 );
 """
 
@@ -262,7 +286,9 @@ def save_line_snapshot(season: int, week: int, home_team: str, away_team: str,
 
 
 def get_line_moves(season: int, week: int, db_path: str | None = None,
-                   move_threshold: float = 1.0) -> list[dict]:
+                   move_threshold: float | None = None) -> list[dict]:
+    if move_threshold is None:
+        move_threshold = float(config.REVIEW_LINE_MOVE_THRESHOLD)
     """Games where the pool line and the closing/live line disagree
     enough to warrant Thursday-morning review: movement >=
     `move_threshold` points, OR the model edge flips sign between the
@@ -299,6 +325,41 @@ def get_line_moves(season: int, week: int, db_path: str | None = None,
                 "edge_flip": bool(edge_flip),
             })
     return sorted(out, key=lambda d: -d["movement"])
+
+
+def save_market_crosscheck(season: int, week: int, home_team: str, away_team: str,
+                           crosscheck_result: dict, db_path: str | None = None):
+    """Persist one market cross-check (batch 2, item 6). Flags are
+    stored as a semicolon-joined string. Log-only: no pick logic reads
+    this table back, so a stored flag can never switch a line."""
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO market_crosschecks (season, week, home_team, away_team, spread_line, "
+            "home_moneyline, away_moneyline, total_line, ml_home_win_prob, ml_implied_margin, "
+            "flags, run_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(season, week, home_team, away_team) DO UPDATE SET "
+            "spread_line=excluded.spread_line, home_moneyline=excluded.home_moneyline, "
+            "away_moneyline=excluded.away_moneyline, total_line=excluded.total_line, "
+            "ml_home_win_prob=excluded.ml_home_win_prob, ml_implied_margin=excluded.ml_implied_margin, "
+            "flags=excluded.flags, run_time=excluded.run_time",
+            (season, week, home_team, away_team, crosscheck_result.get("spread_line"),
+             crosscheck_result.get("home_moneyline"), crosscheck_result.get("away_moneyline"),
+             crosscheck_result.get("total_line"), crosscheck_result.get("ml_home_win_prob"),
+             crosscheck_result.get("ml_implied_margin"),
+             "; ".join(crosscheck_result.get("flags", [])),
+             datetime.utcnow().isoformat()),
+        )
+
+
+def get_market_crosschecks(season: int, week: int, db_path: str | None = None) -> list[dict]:
+    """Market cross-check rows for a week, flagged games first."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM market_crosschecks WHERE season=? AND week=? ORDER BY rowid",
+            (season, week)).fetchall()
+    out = [dict(r) for r in rows]
+    out.sort(key=lambda d: (0 if d.get("flags") else 1))
+    return out
 
 
 def save_injury_returns(season: int, week: int, detail: list[tuple], db_path: str | None = None):
