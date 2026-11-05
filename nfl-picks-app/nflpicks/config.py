@@ -249,6 +249,128 @@ STADIUM_COORDS = {
     "TEN": (36.1665, -86.7713), "WAS": (38.9078, -76.8645),
 }
 
+# ---- Batch 2 (2026-11-04, items 4-6): ensemble / features / market ----
+# All three stay OFF / shadow by default. Nothing in model.py, weekly_run.py
+# or dashboard.py reads these live yet: ensemble.py, features.py and
+# market.py are harness/shadow modules, graded in backtest.py. Flip
+# ENSEMBLE_LIVE only on a walk-forward win (see README batch-2 section);
+# there is no FEATURES_LIVE flag because no feature won out-of-sample,
+# and market cross-checks never switch the pool line by design.
+ENSEMBLE_LIVE = False
+ENSEMBLE_GRID_STEP = 0.25  # simplex grid step for walk-forward weight learning (0.25 -> 35 combos for 4 components)
+ENSEMBLE_MIN_TRAIN_GAMES = 200  # games needed before learned weights replace equal weights
+# Elo (new in batch 2; no Elo existed before). Sequential, win/loss only
+# (no margin multiplier -- blowouts are already in SRS), updated once per
+# week from pre-week ratings so no within-week result leaks into a pick.
+ELO_START = 1500.0
+ELO_K = 20.0
+ELO_PRIOR_REGRESSION = 0.5  # fraction of (rating - 1500) carried into the next season
+ELO_HFA_POINTS = 55.0  # home-field edge in Elo points used in the expected-score formula (approx: ~2 pts of margin)
+# SOS-iterative EPA (batch 2, item 4). Same damped-Jacobi idea as
+# ratings.SRS_DAMPING, applied to offensive/defensive EPA instead of
+# points. The naive weighted_epa_ratings() in epa.py is kept untouched
+# for comparison; sos_epa_ratings() is the new one.
+EPA_SOS_DAMPING = 0.5
+EPA_SOS_MAX_ITERS = 200
+EPA_SOS_TOLERANCE = 1e-4
+# Play-by-play proxies (batch 2, item 5). True early-down success and
+# red-zone efficiency are NOT in the team-stats file (no down/distance
+# or red-zone columns) and the nflverse play-by-play release filename
+# could not be confirmed (guessed URLs 404), so they are NOT built here
+# -- see features.py. What IS built from week-filtered team stats:
+# explosive-play rate, pressure allowed/generated, pass share,
+# first-down rate (a drive-sustainment proxy, NOT early-down success).
+# Feature coefficients are fit by clipped least squares on the training
+# window only (features.fit_feature_coeff), never hand-set per game.
+FEATURE_COEFF_CAPS = {
+    # max |points| a feature differential may move a margin, via its cap
+    # on the fitted coefficient (units differ per feature, see features.py).
+    "explosive": 300.0, "pressure_allowed": 300.0, "pressure_generated": 300.0,
+    "pass_share": 50.0, "first_down": 300.0,
+    "wind_pass": 30.0, "ol_rush": 2000.0,
+}
+# Market cross-checks (batch 2, item 6). Thresholds for FLAGs only --
+# a flag never changes a pick or a line.
+MARKET_MARGIN_SD = 13.5  # normal SD (pts) converting win prob <-> margin; same as SURVIVOR_SPREAD_STDEV
+MARKET_ML_SPREAD_FLAG = 3.0  # |moneyline-implied margin - spread| at/above this flags spread/ML disagreement
+MARKET_MODEL_TOTAL_FLAG = 5.0  # |model total - total line| at/above this flags a totals disagreement (diagnostic only)
+
+# ---- Batch 3 (2026-11-04, items 1-2): standings risk / season simulation ----
+# Both modules are LABEL-ONLY: they suggest gambles and estimate their
+# cost in season odds, they never change a pick. standings.py reads
+# these thresholds at call time (not import time) so a test or caller
+# can patch config and re-run without reloading the module.
+# Thresholds, and why these values:
+#   LATE_WEEKS_LEFT = 4: the rule is silent for the first ~14 weeks.
+#     With 5+ weeks (80+ games) left, default variance alone usually
+#     closes a small gap, and gambling early just burns expected wins.
+#   TRAIL_GAMES = 2: trailing by 1 with 4 weeks left is still
+#     recoverable by default variance over ~64 games, so it does not
+#     trigger; trailing by 2+ does. LAST_WEEK_TRAIL_GAMES = 1 is the
+#     exception: with one week left, mirroring the leader loses
+#     outright, so a 1-game deficit can ONLY be closed (to a tie or,
+#     with several flips, a win) by differentiation.
+#   LEAD_GAMES = 1: any late lead is "protect" mode -- keep defaults,
+#     never flip a strong lean to chase a weekly prize. Protect mode
+#     and neutral mode both yield the default slate; they differ only
+#     in the label (and in what they warn against).
+#   COIN_FLIP_MAX_PROB = 0.55: a game is a coin flip when even the
+#     BEST side's calibrated cover prob is <= 0.55 (39% of 2019-2025
+#     harness games, ~6.8 per late week). Flipping all of them would
+#     be ~7 gambles a week, so MAX_GAMBLES_PER_WEEK = 3 caps it and
+#     cheapest-first ordering (lowest expected-win cost) picks which.
+#   STRONG_LEAN_MIN_PROB = 0.65: a calibrated pick prob >= 0.65
+#     (20% of harness games) is a strong lean -- never a gamble
+#     candidate, and labelled PROTECT when leading late.
+STANDINGS_LATE_WEEKS_LEFT = 4
+STANDINGS_TRAIL_GAMES = 2
+STANDINGS_LAST_WEEK_TRAIL_GAMES = 1
+STANDINGS_LEAD_GAMES = 1
+STANDINGS_COIN_FLIP_MAX_PROB = 0.55
+STANDINGS_STRONG_LEAN_MIN_PROB = 0.65
+STANDINGS_MAX_GAMBLES_PER_WEEK = 3
+# Season simulation (simulation.py). Calibrated cover probs are
+# treated as P(win | decided); SIM_PUSH_PROB is the push mass applied
+# on top (43 pushes in 1,871 harness games = 2.3%). Trials/seed are
+# the reproducibility contract: same seed + same games = same output.
+SIM_TRIALS = 10000
+SIM_SEED = 20261104
+SIM_PUSH_PROB = 0.023
+# Cheap vs expensive weekly gambles (simulation.classify_gamble):
+# CHEAP = expected cost <= 0.10 wins AND season odds do not fall;
+# EXPENSIVE = expected cost >= 0.25 wins OR season odds fall by
+# >= 1.0 pp; anything between is NEUTRAL. The cost axis is expected
+# season wins, the odds axis is P(finishing first) in percentage points.
+SIM_CHEAP_COST_MAX_WINS = 0.10
+SIM_EXPENSIVE_COST_MIN_WINS = 0.25
+SIM_EXPENSIVE_P_FIRST_DROP_PP = 1.0
+
+# ---- Totals model: SRS-style scoring splits (2026-11-04, item 8) ----
+# TOTALS_SRS_LIVE stays False: the SRS totals model (scoring.py) was
+# built and graded point-in-time 2019-2025, and it does NOT beat the old
+# simplified scoring-average blend out-of-sample (SRS 11.04 MAE vs old
+# 10.70 MAE, worse in 6 of 7 seasons, tied in 2025; market line 10.36).
+# The old blend therefore stays live in model.py. Flip this only on a
+# walk-forward win, not on an in-sample fit -- see README item 8.
+# When True, model.py uses scoring.predict_total_srs with the ratings
+# weekly_run.py passes through; when False (default) it uses the old
+# scoring.predict_total, even if SRS ratings were computed. The SRS
+# solve itself reuses the spread model's fade philosophy
+# (PRIOR_FADE_GAMES, PRIOR_REGRESSION) rather than inventing new
+# blending constants; only the solver's own constants live here.
+TOTALS_SRS_LIVE = False
+TOTALS_SRS_DAMPING = 0.5  # damped Jacobi, same idea as SRS_DAMPING in ratings.py
+TOTALS_SRS_MAX_ITERS = 200
+TOTALS_SRS_TOLERANCE = 1e-4
+
+# ---- Submission sheet + Thursday review queue + reliability (2026-11-04, items 3 and 7) ----
+# REVIEW_LINE_MOVE_THRESHOLD: pool-vs-closing movement (points) that
+# puts a game on the Thursday review queue. Same 1 pt value the
+# dashboard's line-moves section used before; it now lives here so
+# db.get_line_moves and review_queue.py share one threshold instead
+# of each hardcoding 1.0. The pool line is still never auto-switched.
+REVIEW_LINE_MOVE_THRESHOLD = 1.0
+
 # ---- Survivor pool ----
 # NFL win probability from a point spread, via a logistic curve fit to
 # historical spread -> win% (the standard "13.5 point stdev" approximation).
