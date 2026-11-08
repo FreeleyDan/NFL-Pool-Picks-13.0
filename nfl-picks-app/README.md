@@ -3357,3 +3357,26 @@ still needs the user's token + repo name before the Sync
 button does anything; until then the dashboard's honest
 state is "local only". No GitHub push was made, no email was
 sent, no current-week picks or leans are in this section.
+
+## Week 9 fix (2026-11-08): turnover-luck adjustment removed from the live pick path -- live == backtest again
+
+**What happened.** Week 9, 2026 was 2-7 ATS on the 9 decided games (wins IND +6, LA -6; losses BAL +9, ATL +3, NYJ +9.5, MIA +7, NO -2.5, PHI +3.5, CAR +3) on a dog-heavy slate (11 dogs, 4 favorites) while favorites went 7-2. The picks themselves were generated correctly -- they match the live model 15/15 -- but the investigation found a structural gap: `weekly_run.py` applied a turnover-luck adjustment (up to +/-3 pts/team) that `backtest.py` never applies, so the quoted 50.03% baseline did not describe the live system. The live system was 49.42% (2019-2025).
+
+**The proper test (2026-11-08).** Walk-forward, fade 6/10/12 x turnover on/off, 2019-2026, point-in-time only (ratings and turnover margins computed from weeks < W), recorded lines, corrected push grading. Script kept outside the repo at `~/workspace/nfl-audit/week9-test/turnover_fade_test.py` with its per-game CSV and summary JSON. The fade-12 turnover-off cell reproduces the canonical baseline exactly (50.03%, 898/1,795, MAE 10.34), which validates the test harness against the original backtest.
+
+| Variant | 2019-2025 | 2026 | 2026 Wk 1-8 | 2026 Wk 9 (recorded) | 2026 Wk 9 (pool lines) |
+|---|---|---|---|---|---|
+| fade-12, turnover OFF | 50.03% (898/1,795) | 54.47% (67/123) | 55.65% (64/115) | 3-5 | 2-7 |
+| fade-12, turnover ON (was live) | 49.42% (893/1,807) | 51.64% (63/122) | 53.10% (60/113) | 3-6 | 2-7 |
+| fade-10, turnover OFF | 48.95% | 54.92% (67/122) | 54.78% | 4-3 | 3-6 |
+| fade-10, turnover ON | 48.48% | 51.61% (64/124) | 53.04% | 3-6 | 3-6 |
+| fade-6, turnover OFF | 47.68% (862/1,808) | 52.42% (65/124) | 50.43% | 7-2 | 5-4 |
+| fade-6, turnover ON | 48.13% | 49.59% (61/123) | 50.88% | 3-6 | 3-6 |
+
+**Verdict.** Fade-12 is CONFIRMED -- do not revert: it beats fade-10 and fade-6 on 2019-2025 and in 2026 Weeks 1-8, and wins every week bucket. Fade-6's Week 9 (7-2 recorded / 5-4 pool) is a 9-game outlier. The turnover adjustment HURTS at fade-12 (-0.61 pp in 2019-2025, -2.83 pp in 2026) and its MAE is worse in all three fades; paired off-vs-on is +0.63 pp, z=0.66 -- suggestive, not proven alone -- but there is no demonstrated benefit in any fade, so it is off. It also pushes the model toward underdogs (71% dog picks live vs 65% without; favorite picks 46.47% vs 48.39%), and the damage is concentrated late-season (weeks 10+: 47.74% on vs 49.72% off at fade-12).
+
+**What changed.** `config.TURNOVER_LUCK_LIVE = False` (with the evidence in the comment); `weekly_run._apply_turnover_adjustment()` gates the application and records the diagnostic either way; the adjustment code itself is unchanged and stays in `nflpicks/turnovers.py` for shadow use. The fade stays 12. No other live pick input changed, and after this change there is no remaining live-vs-backtest gap for spread picks: live ratings are the plain SRS ratings the backtest grades.
+
+**Honest limits.** Removing the adjustment would NOT have saved Week 9 on pool lines (still 2-7). The expected gain is about +0.6-0.8 pp over many games, not a Week 10 miracle. The paired z=0.66 means the turnover effect is not proven on its own; the removal is justified by the cumulative case (no benefit in any fade, worse MAE in all three, 2026 held-out agrees, and live == backtest alignment), not by a single significant test. If the adjustment is ever reconsidered, it needs a walk-forward win, not one week.
+
+**Tests.** Full suite: 314/314 pass (310 prior + 4 new). `tests/test_week9_turnover.py` (offline, synthetic team stats): flag defaults False; helper applies nothing when off and records an OFF diagnostic; helper applies the capped +/-3.0 adjustment when on; helper applies nothing when team stats are missing. `TURNOVER_LUCK_LIVE` was also added to the OFF_BY_DEFAULT guard in `test_batch5_groupC.py`, so a future batch cannot silently flip it back on. Verified end-to-end offline: with the flag off, the live pick path reproduces the test's fade-12 turnover-off Week 9 picks exactly, 15/15 (2-7 on the decided 9, pool lines).

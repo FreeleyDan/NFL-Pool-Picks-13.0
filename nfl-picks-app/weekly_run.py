@@ -148,6 +148,48 @@ def main():
         db.save_diagnostics(data.DIAGNOSTICS)
 
 
+def _apply_turnover_adjustment(team_ratings: dict, team_stats) -> dict:
+    """Apply the turnover-luck regression to `team_ratings` in place
+    and return the {team: points} adjustment applied -- or apply
+    nothing and return {} when config.TURNOVER_LUCK_LIVE is False
+    (the default since 2026-11-08; see config.py for the
+    walk-forward evidence). The team-stats load stays with the
+    caller (it also feeds the EPA layer), so this helper only
+    decides and applies. `team_stats` may be None (load failed):
+    then no adjustment is possible either way. Kept as a separate
+    function so the on/off behaviour is unit-testable offline
+    without running a whole weekly run."""
+    from nflpicks import turnovers as turnovers_mod
+
+    if not getattr(config, "TURNOVER_LUCK_LIVE", False):
+        data._record(
+            "Turnover luck regression", True,
+            "OFF (config.TURNOVER_LUCK_LIVE=False, 2026-11-08 walk-forward test: "
+            "the adjustment cost ATS at fade-12 with no demonstrated benefit in any fade) "
+            "-- ratings are the plain SRS ratings the backtest grades, so live == backtest.",
+        )
+        return {}
+    turnover_margins = turnovers_mod.compute_turnover_margins(team_stats)
+    turnover_luck_adj = turnovers_mod.luck_adjustment(turnover_margins)
+    if turnover_luck_adj:
+        for t, adj in turnover_luck_adj.items():
+            if t in team_ratings:
+                team_ratings[t] = round(team_ratings[t] + adj, 2)
+        nonzero = {t: a for t, a in turnover_luck_adj.items() if a != 0}
+        biggest = sorted(nonzero.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
+        data._record(
+            "Turnover luck regression", True,
+            (f"Applied to {len(nonzero)} teams. Largest adjustments: "
+             + ", ".join(f"{t} {a:+.1f}" for t, a in biggest)) if nonzero
+            else "Team stats loaded, but no team's turnover margin was large enough to trigger an adjustment.",
+        )
+    else:
+        data._record("Turnover luck regression", False,
+                     "Team stats unavailable or missing turnover columns (expected before the season "
+                     "starts) -- no adjustment applied this run.")
+    return turnover_luck_adj
+
+
 def _run():
     log.info("Loading schedule/results for season %s...", config.SEASON)
     games = data.load_games(config.SEASON)
@@ -198,26 +240,11 @@ def _run():
     # Turnover luck regression applies HERE, before the snapshot is saved
     # and before the trace/sign-check diagnostics run, so everything
     # downstream (dashboard, picks, survivor) sees the same final rating.
+    # CHANGED 2026-11-08: gated behind config.TURNOVER_LUCK_LIVE
+    # (False -- see config.py). _apply_turnover_adjustment decides,
+    # applies, and records the diagnostic either way.
     team_stats = data.load_team_stats(config.SEASON)
-    from nflpicks import turnovers as turnovers_mod
-    turnover_margins = turnovers_mod.compute_turnover_margins(team_stats)
-    turnover_luck_adj = turnovers_mod.luck_adjustment(turnover_margins)
-    if turnover_luck_adj:
-        for t, adj in turnover_luck_adj.items():
-            if t in team_ratings:
-                team_ratings[t] = round(team_ratings[t] + adj, 2)
-        nonzero = {t: a for t, a in turnover_luck_adj.items() if a != 0}
-        biggest = sorted(nonzero.items(), key=lambda x: abs(x[1]), reverse=True)[:5]
-        data._record(
-            "Turnover luck regression", True,
-            (f"Applied to {len(nonzero)} teams. Largest adjustments: "
-             + ", ".join(f"{t} {a:+.1f}" for t, a in biggest)) if nonzero
-            else "Team stats loaded, but no team's turnover margin was large enough to trigger an adjustment.",
-        )
-    else:
-        data._record("Turnover luck regression", False,
-                     "Team stats unavailable or missing turnover columns (expected before the season "
-                     "starts) -- no adjustment applied this run.")
+    turnover_luck_adj = _apply_turnover_adjustment(team_ratings, team_stats)
 
     db.save_ratings_snapshot(config.SEASON, week, team_ratings, games_played, raw_diff)
 
@@ -231,7 +258,8 @@ def _run():
     # last season's differential only for teams with a thin current
     # sample. Compares against the rating BEFORE the turnover luck
     # adjustment, since that adjustment can legitimately flip a
-    # borderline team's sign on purpose.
+    # borderline team's sign on purpose. (With TURNOVER_LUCK_LIVE=False
+    # the adjustment is {} so this is just the live rating.)
     pre_turnover_rating = {t: r - turnover_luck_adj.get(t, 0.0) for t, r in team_ratings.items()}
     raw_diff_current = ratings.raw_point_differential(played) if len(played) else {}
     raw_diff_check = {}

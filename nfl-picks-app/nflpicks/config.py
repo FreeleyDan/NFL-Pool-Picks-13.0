@@ -113,6 +113,21 @@ TURNOVER_LUCK_PERSISTENCE = 0.25  # fraction of turnover margin treated as real 
 TURNOVER_LUCK_FULL_SAMPLE_GAMES = 8  # games needed before the correction applies at full confidence
 POINTS_PER_TURNOVER = 4.5         # commonly-cited expected-points value of a turnover
 TURNOVER_LUCK_CAP = 3.0           # max rating adjustment in either direction, points
+# TURNOVER_LUCK_LIVE stays False (2026-11-08): the walk-forward test
+# that week (fade 6/10/12 x turnover on/off, 2019-2026, point-in-time,
+# recorded lines) found the adjustment COSTS at the live fade-12 --
+# 49.42% ATS 2019-2025 (893/1,807) with it on vs 50.03% (898/1,795)
+# off, 51.64% vs 54.47% in 2026 -- and a worse MAE in all three
+# fades (10.45 vs 10.34 at fade-12, 2019-2025). Paired off-vs-on
+# +0.63 pp, z=0.66: suggestive, not proven alone, but there is no
+# demonstrated benefit in any fade, and this was the one live pick
+# input the backtest harness never graded, so the quoted 50.03%
+# did not describe the live system (live was 49.42%). Off makes
+# live == backtest for spread picks. Flip only on a walk-forward
+# win, not on one week: turnover-off Week 9 2026 on pool lines was
+# still 2-7, the same as live -- this change is for the next
+# hundred games, not a rewrite of last week.
+TURNOVER_LUCK_LIVE = False
 
 # ---- Pool line overrides ----
 # Your pool may lock a different line than the live market (e.g. the

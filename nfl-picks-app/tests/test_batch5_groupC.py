@@ -27,6 +27,10 @@ OFF_BY_DEFAULT = (
     "UNCERTAINTY_PICK_USE", "PBP_FEATURES_LIVE", "TEAM_HFA_LIVE",
     "DYNAMIC_BLEND_LIVE", "SITUATIONAL_LIVE", "REST_TRAVEL_EXACT_LIVE",
     "WEATHER_KICKOFF_LIVE", "UNIT_DEPLETION_LIVE", "REF_COACH_LIVE",
+    "TURNOVER_LUCK_LIVE",  # added 2026-11-08: walk-forward test
+    # showed the turnover adjustment costs ATS at the live fade-12
+    # with no demonstrated benefit in any fade; live == backtest
+    # only while this stays False.
 )
 
 
