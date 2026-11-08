@@ -298,31 +298,29 @@ class TestCommittedDbSetup(unittest.TestCase):
 
 
 class TestTestsWorkflow(unittest.TestCase):
+    # NOTE: these tests deliberately avoid PyYAML. The CI image installs
+    # only requirements.txt, which does not (and should not) include yaml
+    # -- a test-only dependency broke every workflow run on 2026-11-05
+    # (ModuleNotFoundError: No module named 'yaml'), and because the
+    # weekly workflow runs tests fail-fast, no Week 9 picks were ever
+    # generated. Plain-text checks are enough for this file.
     def test_workflow_file_exists_and_parses(self):
-        import yaml
         path = REPO_ROOT / ".github" / "workflows" / "tests.yml"
         self.assertTrue(path.exists(), "tests.yml must exist at the repo root")
-        wf = yaml.safe_load(path.read_text())
-        self.assertEqual(wf["name"], "Tests")
-        # PyYAML reads the `on:` key as boolean True (YAML 1.1).
-        on_value = wf.get("on", wf.get(True))
-        self.assertIn("push", on_value)
-        self.assertIn("pull_request", on_value)
+        text = path.read_text()
+        self.assertIn("name: Tests", text)
+        self.assertIn("push", text)
+        self.assertIn("pull_request", text)
 
     def test_workflow_runs_compile_and_unittest(self):
-        import yaml
         path = REPO_ROOT / ".github" / "workflows" / "tests.yml"
-        wf = yaml.safe_load(path.read_text())
-        steps = wf["jobs"]["tests"]["steps"]
-        run_text = "\n".join(str(s.get("run", "")) for s in steps)
-        self.assertIn("py_compile", run_text)
-        self.assertIn("nfl-picks-app/nflpicks", run_text)
-        self.assertIn("unittest discover", run_text)
-        self.assertIn("nfl-picks-app", run_text)
-        # Runs on the same Python the weekly workflow pins.
-        setup = [s for s in steps if s.get("uses", "").startswith("actions/setup-python")]
-        self.assertEqual(len(setup), 1)
-        self.assertEqual(setup[0]["with"]["python-version"], "3.12")
+        text = path.read_text()
+        self.assertIn("py_compile", text)
+        self.assertIn("nfl-picks-app/nflpicks", text)
+        self.assertIn("unittest discover", text)
+        self.assertIn("nfl-picks-app", text)
+        self.assertIn("actions/setup-python", text)
+        self.assertIn('"3.12"', text)
 
 
 if __name__ == "__main__":
