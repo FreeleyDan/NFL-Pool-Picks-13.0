@@ -81,11 +81,11 @@ class TestCalibration(unittest.TestCase):
         self.assertAlmostEqual(p0, 0.5, delta=0.05)
         self.assertLess(calibration.cover_probability_home(-10.0, 0.0),
                         calibration.cover_probability_home(10.0, 0.0))
-        # Shrunk: a raw 8-pt edge is worth ~5.8 pts, so prob < normal approx.
+        # Shrunk: a raw 8-pt edge is worth ~7.3 pts, so prob < normal approx.
         self.assertLess(calibration.cover_probability_home(8.0, 0.0), 0.75)
 
     def test_shrunk_margin(self):
-        self.assertAlmostEqual(calibration.shrunk_margin(10.0), 0.36 + 6.8, places=2)
+        self.assertAlmostEqual(calibration.shrunk_margin(10.0), 0.19 + 8.9, places=2)
 
 
 class TestConfigAndModel(unittest.TestCase):

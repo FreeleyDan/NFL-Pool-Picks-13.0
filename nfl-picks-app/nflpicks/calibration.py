@@ -7,10 +7,15 @@ treated the model margin as if it were calibrated 1:1 with the actual
 margin. On point-in-time backtest data (2019-2025, n=1,871, see
 backtest.py) the regression of actual margin on model margin is:
 
-    actual ~= 0.36 + 0.68 * model_margin,  residual SD 13.43
+    actual ~= 0.19 + 0.89 * model_margin,  residual SD 13.27
 
-A slope of 0.68, not 1.0, means the raw model is over-dispersed: a model
-edge of 8 points is worth only ~5.8 points of actual edge on average.
+A slope of 0.89, not 1.0, means the raw model is mildly over-dispersed:
+a model edge of 8 points is worth only ~7.3 points of actual edge on
+average. (Re-fit 2026-11-18, batch 7: the old 0.36/0.68 coefficients
+did not reproduce from the current model's margins — OLS on the same
+2019-2025 sample gives 0.19/0.89 — and over-shrank the displayed
+probabilities. The old constants dated to an earlier margin
+definition and were never re-fit after the model changed.)
 Using the raw margin therefore overstated cover probabilities, most
 noticeably for large edges -- exactly where the backtest also showed
 no edge-bucket accuracy gain (8+ bucket: 49.3% ATS, MAE 13.70).
@@ -28,16 +33,19 @@ What this module does:
 
 What it does NOT do:
   * It does not change the pick. A shrunk-margin pick rule (pick by
-    shrunk margin vs line) was tested on the same in-sample data:
-    49.4% vs 47.7% ATS, paired z=1.69, 368/1,828 flips. That is fit
-    in-sample and too weak to flip live picks on; it stays behind
-    config.CALIBRATED_PICK=False. Cover Prob here is therefore a
-    confidence signal: a value near or below 50% for the official pick
-    means, honestly, that the model side is not actually favoured after
-    shrinkage -- treat it as a coin flip, not as a confident lean.
-  * The quantile table is a snapshot of 2019-2025 residuals. Re-fit it
-    from backtest.py output when the model changes materially, or the
-    calibration will drift with the model it was fit on.
+    shrunk margin vs line) was tested walk-forward 2000-2026 (batch 7,
+    2026-11-18): 50.43% vs live 50.76% ATS, paired z=-1.13, 0 era wins,
+    flips 47.53% vs live 52.47% on the same games. It loses, so it
+    stays behind config.CALIBRATED_PICK=False. Cover Prob here is
+    therefore a confidence signal: a value near or below 50% for the
+    official pick means, honestly, that the model side is not actually
+    favoured after shrinkage -- treat it as a coin flip, not as a
+    confident lean.
+  * The quantile table is a snapshot of 2019-2025 residuals, re-fit
+    2026-11-18 (batch 7) alongside the constants. Re-fit it from
+    backtest.py output when the model changes materially, or the
+    calibration will drift with the model it was fit on -- which is
+    exactly what happened to the 0.36/0.68 constants.
 """
 from __future__ import annotations
 
@@ -45,12 +53,13 @@ from . import config
 
 # (cumulative probability, shrunk residual in points), from the
 # 2019-2025 point-in-time backtest (shrunk residual = actual margin -
-# (0.36 + 0.68 * model margin), n=1,871, mean ~0, SD 13.43).
+# (0.19 + 0.89 * model margin), n=1,871, mean -0.01, SD 13.27).
+# Re-fit 2026-11-18 (batch 7) with the new constants.
 RESIDUAL_QUANTILES: list[tuple[float, float]] = [
-    (0.010, -31.56), (0.025, -26.54), (0.050, -21.92), (0.100, -16.87),
-    (0.200, -10.38), (0.300, -6.57), (0.400, -3.15), (0.500, -0.31),
-    (0.600, 2.77), (0.700, 6.04), (0.800, 10.81), (0.900, 17.57),
-    (0.950, 23.66), (0.975, 27.04), (0.990, 31.74),
+    (0.010, -30.84), (0.025, -26.28), (0.050, -21.34), (0.100, -16.74),
+    (0.200, -10.31), (0.300, -6.68), (0.400, -3.10), (0.500, -0.25),
+    (0.600, 2.81), (0.700, 5.81), (0.800, 10.69), (0.900, 17.32),
+    (0.950, 23.17), (0.975, 27.33), (0.990, 30.96),
 ]
 
 

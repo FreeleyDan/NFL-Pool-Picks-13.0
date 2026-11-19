@@ -152,7 +152,9 @@ Harness, live-like HFA, 2019-2025 (n=1,871 games, 1,828 decided):
 - Calibrated pick (pick by shrunk margin vs line): 50.16% (+1.04 pp,
   paired z=0.99, 369 flips). Noise on this sample, and the shrinkage
   coefficients were fit on the same data, so `CALIBRATED_PICK` stays
-  False. Cover Prob itself IS calibrated (see below) -- that is a
+  False. Walk-forward re-test 2000-2026 (batch 7, 2026-11-18) confirms
+  the rejection: 50.43% vs live 50.76%, paired z=-1.13, 0 era wins.
+  Cover Prob itself IS calibrated (see below) -- that is a
   confidence signal, not a pick change.
 - Offense/defense split SRS (harness diagnostic only): 48.85%
   (+0.11 pp, paired z=0.08) with MAE 10.71 (worse). NOT promoted.
@@ -168,10 +170,13 @@ canonical ones by the harness above, but they point the same way.
 
 **Item 2 -- Cover Prob is now calibrated.** Old: normal curve, SD
 13.5, around the raw model margin. New (`nflpicks/calibration.py`):
-actual margin regresses on model margin with slope 0.68, intercept
-0.36, residual SD 13.43, and cover probability interpolates the
+actual margin regresses on model margin with slope 0.89, intercept
+0.19, residual SD 13.27, and cover probability interpolates the
 empirical residual CDF from 2019-2025 (key-number clustering kept:
 actual margin == 3 in 7.1% of games per side, == 7 in ~4.2%).
+Re-fit 2026-11-18 (batch 7): the old 0.36/0.68 constants did not
+reproduce from the current model's margins and over-shrank the
+displayed probabilities.
 A Cover Prob near or below 50% for the official pick is honest:
 after shrinkage that side is not actually favoured -- treat it as a
 coin flip.

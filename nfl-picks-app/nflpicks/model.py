@@ -103,7 +103,7 @@ def _cover_probability(independent: float, line: float) -> float:
     # CHANGED 2026-11-04 (backtest item 2): calibrated empirical cover
     # probability (calibration.py), not the old normal/13.5 approx.
     # The normal approx. treated the raw model margin as calibrated 1:1;
-    # backtest regression is actual ~= 0.36 + 0.68 * model, so raw edges
+    # backtest regression is actual ~= 0.19 + 0.89 * model, so raw edges
     # were overstated. This returns the home-side probability so the
     # direction is unambiguous; the caller converts it to the pick side.
     return calibration.cover_probability_home(independent, line)

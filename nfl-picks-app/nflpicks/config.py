@@ -155,15 +155,18 @@ EPA_BLEND = 0.5
 # not proven, hence EPA_LIVE stays False above.
 EPA_POINTS_PER_UNIT = 0.38
 # ---- Cover-probability calibration (backtest item 2) ----
-# Actual margin ~ model margin regresses with slope ~0.68, intercept ~0.36
-# on 2019-2025 point-in-time data (residual SD 13.43): the raw model is
-# over-dispersed. calibration.py shrinks the model margin by these
-# coefficients before turning it into a cover probability. This does NOT
-# change the pick: a shrunk-margin pick test was fit in-sample only
-# (49.4% vs 47.7%, paired z=1.69, 368 flips) and is kept behind
-# CALIBRATED_PICK=False until a walk-forward test confirms it.
-COVER_SHRINK_SLOPE = 0.68
-COVER_SHRINK_INTERCEPT = 0.36
+# Actual margin ~ model margin regresses with slope ~0.89, intercept ~0.19
+# on 2019-2025 point-in-time data (residual SD 13.27): the raw model is
+# mildly over-dispersed. calibration.py shrinks the model margin by these
+# coefficients before turning it into a cover probability. Re-fit
+# 2026-11-18 (batch 7): the old 0.36/0.68 did not reproduce from the
+# current model's margins (OLS 0.19/0.89) and over-shrank the displayed
+# probabilities. This does NOT change the pick: a shrunk-margin pick rule
+# was tested walk-forward 2000-2026 (batch 7) and loses (50.43% vs live
+# 50.76%, paired z=-1.13, 0 era wins), so it stays behind
+# CALIBRATED_PICK=False.
+COVER_SHRINK_SLOPE = 0.89
+COVER_SHRINK_INTERCEPT = 0.19
 CALIBRATED_PICK = False  # if True, model.py picks by shrunk margin vs line; OFF by default
 # ---- QB change review signal (backtest item 5) ----
 # Situational proxy 2019-2025: a QB change / non-season-mode QB carries a
